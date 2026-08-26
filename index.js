@@ -23,8 +23,9 @@ async function getLineImage(messageId) {
 }
 
 // ส่งรูปให้ Claude อ่านตัวหนังสือ แล้วแปลงเป็นข้อมูลสต็อก
-async function readStockImage(base64, mediaType) {
-  const prompt = `นี่คือรูปฟอร์มบันทึกสต็อกสินค้า (แบบฟอร์ม STK07) ตารางมีหัวคอลัมน์เรียงจากซ้ายไปขวาดังนี้เป๊ะๆ:
+// รับได้หลายรูปพร้อมกัน (images = array ของ {base64, mediaType})
+async function readStockImages(images) {
+  const prompt = `นี่คือรูปฟอร์มบันทึกสต็อกสินค้า (แบบฟอร์ม STK07) จำนวน ${images.length} รูป อาจเป็นคนละหน้าหรือครึ่งบน-ครึ่งล่างของตารางเดียวกัน ให้อ่านทีละรูปแยกจากกัน ตารางมีหัวคอลัมน์เรียงจากซ้ายไปขวาดังนี้เป๊ะๆ:
 1. "หมวดหมู่" - รหัสหมวด เช่น PD09
 2. "รายการสินค้า" - ชื่อสินค้า
 3. "หน่วยนับ" - หน่วย เช่น ซอง, ถัง, กล่อง
@@ -34,10 +35,17 @@ async function readStockImage(base64, mediaType) {
 7. "-เบิก" - จำนวนที่เบิกออกใช้วันนี้ (อยู่ตำแหน่งที่ 7 นับจากซ้าย ก่อนคอลัมน์สุดท้าย)
 8. "คงเหลือ" - ยอดคงเหลือหลังหักเบิกแล้ว (คอลัมน์ขวาสุด)
 
-กติกาสำคัญ: อ่านตัวเลขแต่ละแถวโดยยึดตำแหน่งคอลัมน์เป็นหลัก นับตำแหน่งคอลัมน์จากซ้ายไปขวาให้ตรงทุกแถว อย่าเดาจากบริบทหรือความสมเหตุสมผลของตัวเลข ถ้าช่องไหนว่างเปล่าไม่มีตัวเลขเขียนไว้ ให้ใส่ 0 (ไม่ใช่ null) เพราะในฟอร์มนี้ช่องว่างหมายถึงไม่มีการเคลื่อนไหว
+กติกาสำคัญ: ตารางนี้มีเส้นตีกรอบแบ่งแถวและคอลัมน์ชัดเจน ให้ไล่อ่านทีละแถวจากบนลงล่างอย่างเป็นระบบในแต่ละรูป ก่อนอ่านตัวเลขในแต่ละแถว ให้ระบุชื่อสินค้าของแถวนั้นก่อน แล้วค่อยลากสายตาไปทางขวาตามแนวเส้นตารางเดียวกันเพื่ออ่านตัวเลขแต่ละคอลัมน์ ห้ามข้ามไปอ่านตัวเลขจากแถวบนหรือแถวล่างเด็ดขาด นับจำนวนแถวทั้งหมดในแต่ละรูปก่อน แล้วให้แน่ใจว่าจำนวนรายการที่ตอบกลับตรงกับจำนวนแถวที่นับได้ อย่าเดาจากบริบทหรือความสมเหตุสมผลของตัวเลข ถ้าช่องไหนว่างเปล่าไม่มีตัวเลขเขียนไว้ ให้ใส่ 0 (ไม่ใช่ null) เพราะในฟอร์มนี้ช่องว่างหมายถึงไม่มีการเคลื่อนไหว
 
-ตอบกลับเป็น JSON array เท่านั้น ไม่ต้องมีคำอธิบายอื่นใดๆ ทั้งสิ้น รูปแบบแต่ละแถว:
-{"หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลข, "คงเหลือ": ตัวเลข}`;
+ตอบกลับเป็น JSON array เท่านั้น รวมทุกรูปไว้ใน array เดียว ไม่ต้องมีคำอธิบายอื่นใดๆ ทั้งสิ้น รูปแบบแต่ละแถว:
+{"รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลข, "คงเหลือ": ตัวเลข}`;
+
+  const content = [];
+  images.forEach((img, idx) => {
+    content.push({ type: 'text', text: `รูปที่ ${idx + 1}:` });
+    content.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.base64 } });
+  });
+  content.push({ type: 'text', text: prompt });
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -48,15 +56,8 @@ async function readStockImage(base64, mediaType) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-5',
-      max_tokens: 4096,
-      thinking: { type: 'disabled' },
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-          { type: 'text', text: prompt }
-        ]
-      }]
+      max_tokens: 8000,
+      messages: [{ role: 'user', content }]
     })
   });
 
@@ -98,33 +99,41 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('OK');
 
   const events = req.body.events || [];
-  for (const event of events) {
-    if (event.type === 'message' && event.message.type === 'image') {
-      try {
-        console.log('กำลังดึงรูป messageId:', event.message.id);
-        const { base64, mediaType } = await getLineImage(event.message.id);
+  const imageEvents = events.filter(e => e.type === 'message' && e.message.type === 'image');
+  if (imageEvents.length === 0) return;
 
-        console.log('กำลังส่งให้ AI อ่าน...');
-        const resultJsonText = await readStockImage(base64, mediaType);
-        console.log('ผลลัพธ์:', resultJsonText);
+  // ใช้ replyToken ของรูปสุดท้ายในชุดนี้ ส่งข้อความสรุปกลับไปครั้งเดียว
+  const replyToken = imageEvents[imageEvents.length - 1].replyToken;
 
-        // แปลงเป็นข้อความอ่านง่าย ส่งกลับให้พนักงานเช็ค
-        let displayText;
-        try {
-          const items = extractJsonArray(resultJsonText);
-          displayText = 'อ่านได้ดังนี้ (เช็คให้ตรงก่อนนะครับ):\n\n' +
-            items.map(i => `- ${i['สินค้า']} | รับ: ${i['รับ']} | เบิก: ${i['เบิก']} | คงเหลือ: ${i['คงเหลือ']}`).join('\n');
-        } catch (e) {
-          console.error('parse JSON ไม่ผ่าน:', e.message);
-          displayText = 'อ่านได้ผลลัพธ์นี้ (รูปแบบไม่ตรง JSON เช็คด้วยตนเอง):\n' + resultJsonText;
-        }
-
-        await replyToLine(event.replyToken, displayText);
-      } catch (err) {
-        console.error('เกิดข้อผิดพลาด:', err.message);
-        await replyToLine(event.replyToken, 'ขออภัย อ่านรูปไม่สำเร็จ ลองถ่ายใหม่อีกครั้งครับ');
-      }
+  try {
+    console.log(`กำลังดึงรูปทั้งหมด ${imageEvents.length} รูป...`);
+    const images = [];
+    for (const event of imageEvents) {
+      images.push(await getLineImage(event.message.id));
     }
+
+    console.log('กำลังส่งให้ AI อ่านพร้อมกัน...');
+    const resultJsonText = await readStockImages(images);
+    console.log('ผลลัพธ์:', resultJsonText);
+
+    let displayText;
+    try {
+      const items = extractJsonArray(resultJsonText);
+      const multiImage = imageEvents.length > 1;
+      displayText = 'อ่านได้ดังนี้ (เช็คให้ตรงก่อนนะครับ):\n\n' +
+        items.map(i => {
+          const tag = multiImage ? `[รูป ${i['รูปที่']}] ` : '';
+          return `${tag}${i['ลำดับ']}. ${i['สินค้า']} | รับ: ${i['รับ']} | เบิก: ${i['เบิก']} | คงเหลือ: ${i['คงเหลือ']}`;
+        }).join('\n');
+    } catch (e) {
+      console.error('parse JSON ไม่ผ่าน:', e.message);
+      displayText = 'อ่านได้ผลลัพธ์นี้ (รูปแบบไม่ตรง JSON เช็คด้วยตนเอง):\n' + resultJsonText;
+    }
+
+    await replyToLine(replyToken, displayText);
+  } catch (err) {
+    console.error('เกิดข้อผิดพลาด:', err.message);
+    await replyToLine(replyToken, 'ขออภัย อ่านรูปไม่สำเร็จ ลองถ่ายใหม่อีกครั้งครับ');
   }
 });
 
