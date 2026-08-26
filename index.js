@@ -25,7 +25,7 @@ async function getLineImage(messageId) {
 // ส่งรูปให้ Claude อ่านตัวหนังสือ แล้วแปลงเป็นข้อมูลสต็อก
 // รับได้หลายรูปพร้อมกัน (images = array ของ {base64, mediaType})
 async function readStockImages(images) {
-  const prompt = `นี่คือรูปฟอร์มบันทึกสต็อกสินค้า (แบบฟอร์ม STK07) จำนวน ${images.length} รูป อาจเป็นคนละหน้าหรือครึ่งบน-ครึ่งล่างของตารางเดียวกัน ให้อ่านทีละรูปแยกจากกัน ตารางมีหัวคอลัมน์เรียงจากซ้ายไปขวา แต่ให้อ่านเก็บข้อมูลเฉพาะ 4 คอลัมน์ตัวเลขนี้เท่านั้น:
+  const prompt = `นี่คือรูปฟอร์มบันทึกสต็อกสินค้า (แบบฟอร์ม STK) จำนวน ${images.length} รูป แต่ละรูปมีรหัสฟอร์มเขียนกำกับไว้มุมขวาบน (เช่น STK01, STK02, ... STK07) ให้อ่านรหัสนี้ของแต่ละรูปด้วย แล้วใส่กำกับไว้ในทุกแถวที่มาจากรูปนั้น ตารางมีหัวคอลัมน์เรียงจากซ้ายไปขวา แต่ให้อ่านเก็บข้อมูลเฉพาะ 4 คอลัมน์ตัวเลขนี้เท่านั้น:
 1. "ยกยอดมา" - ยอดที่ยกมาจากวันก่อน
 2. "+รับ" - จำนวนที่รับเข้าวันนี้
 3. "-เบิก" - จำนวนที่เบิกออกใช้วันนี้
@@ -38,7 +38,7 @@ async function readStockImages(images) {
 สำหรับคอลัมน์ "เบิก" เท่านั้น: ต้องแยกแยะให้ชัดระหว่างช่องที่ไม่มีลายมือเขียนอะไรเลย (ว่างจริง) กับช่องที่เขียนเลข 0 ไว้ ถ้าไม่มีลายมือเขียนอะไรในช่องเบิกเลย ให้ใส่ค่า null (ห้ามใส่ 0 แทน) ถ้ามีคนเขียนตัวเลขไว้จริง (รวมถึงเลข 0) ให้ใส่ตัวเลขนั้นตามที่เขียนจริง
 
 ตอบกลับเป็น JSON array เท่านั้น รวมทุกรูปไว้ใน array เดียว ไม่ต้องมีคำอธิบายอื่นใดๆ ทั้งสิ้น รูปแบบแต่ละแถว:
-{"รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลขหรือnull, "คงเหลือ": ตัวเลข}`;
+{"stk": "รหัสฟอร์มเช่น STK04", "รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลขหรือnull, "คงเหลือ": ตัวเลข}`;
 
   const content = [];
   images.forEach((img, idx) => {
@@ -83,6 +83,13 @@ function extractJsonArray(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
+// แสดงตัวเลข: ถ้าเป็นจำนวนเต็มคงเดิม ถ้ามีทศนิยมให้ปัดเหลือ 2 ตำแหน่ง
+function fmtNum(n) {
+  const num = Number(n);
+  if (isNaN(num)) return n;
+  return Number.isInteger(num) ? String(num) : num.toFixed(2);
+}
+
 // เช็คและปรับปรุงค่า "เบิก" จาก 3 ค่าที่ยึดตามกระดาษ (ห้ามแก้): ยกยอดมา, รับ, คงเหลือ
 // สูตร: ยกยอดมา + รับ - เบิก = คงเหลือ  =>  เบิกที่ถูกต้อง = ยกยอดมา + รับ - คงเหลือ
 function reconcileItem(item) {
@@ -97,9 +104,9 @@ function reconcileItem(item) {
 
   let เหตุผล = '';
   if (wasBlank) {
-    เหตุผล = `ช่องเบิกว่าง คำนวณให้จาก ${yok}+${rap}-${kong} = ${correctBik}`;
+    เหตุผล = `ช่องเบิกว่าง คำนวณให้จาก ${fmtNum(yok)}+${fmtNum(rap)}-${fmtNum(kong)} = ${fmtNum(correctBik)}`;
   } else if (mismatch) {
-    เหตุผล = `เบิกเดิมเขียน ${writtenBik} แต่คำนวณจาก ${yok}+${rap}-${kong} ได้ ${correctBik} (แก้ไขแล้ว)`;
+    เหตุผล = `เบิกเดิมเขียน ${fmtNum(writtenBik)} แต่คำนวณจาก ${fmtNum(yok)}+${fmtNum(rap)}-${fmtNum(kong)} ได้ ${fmtNum(correctBik)} (แก้ไขแล้ว)`;
   }
 
   return {
@@ -114,13 +121,34 @@ function reconcileItem(item) {
 // สร้าง Flex Message แสดงรายการทั้งหมด แถวไหนสูตรไม่ตรงจะขึ้นตัวหนังสือสีแดง
 // แบ่งเป็นหลายบับเบิล (การ์ด) บับเบิลละไม่เกิน 20 แถว รวมเป็น carousel เดียว
 function buildValidationFlex(items) {
+  // เรียงตามรหัสฟอร์ม STK01 -> STK07 (ดึงตัวเลขจากรหัสมาเทียบ) แล้วตามด้วยลำดับแถวเดิมในฟอร์มนั้น
+  const stkNum = (stk) => {
+    const m = String(stk || '').match(/\d+/);
+    return m ? parseInt(m[0], 10) : 999;
+  };
+  const sorted = [...items].sort((a, b) => {
+    const diff = stkNum(a['stk']) - stkNum(b['stk']);
+    if (diff !== 0) return diff;
+    return (Number(a['ลำดับ']) || 0) - (Number(b['ลำดับ']) || 0);
+  });
+
+  // แบ่งเป็นการ์ด: ขึ้นการ์ดใหม่ทุกครั้งที่เปลี่ยน STK หรือครบ chunkSize
   const chunkSize = 20;
   const chunks = [];
-  for (let i = 0; i < items.length; i += chunkSize) {
-    chunks.push(items.slice(i, i + chunkSize));
+  let current = [];
+  let currentStk = null;
+  for (const item of sorted) {
+    if (current.length === 0) currentStk = item['stk'];
+    if (item['stk'] !== currentStk || current.length >= chunkSize) {
+      chunks.push(current);
+      current = [];
+      currentStk = item['stk'];
+    }
+    current.push(item);
   }
+  if (current.length > 0) chunks.push(current);
 
-  const bubbles = chunks.map((chunk, chunkIdx) => ({
+  const bubbles = chunks.map((chunk) => ({
     type: 'bubble',
     size: 'giga',
     body: {
@@ -130,7 +158,7 @@ function buildValidationFlex(items) {
       contents: [
         {
           type: 'text',
-          text: `รายการที่ ${chunkIdx * chunkSize + 1}-${chunkIdx * chunkSize + chunk.length}`,
+          text: `${chunk[0]['stk'] || 'ไม่ทราบฟอร์ม'} (${chunk.length} รายการ)`,
           weight: 'bold',
           size: 'sm',
           color: '#888888'
@@ -140,7 +168,7 @@ function buildValidationFlex(items) {
           const label = item['ผิดปกติ']
             ? `⚠️ ${item['ลำดับ']}. ${item['สินค้า']}`
             : `${item['ลำดับ']}. ${item['สินค้า']}`;
-          const detail = `ยกมา:${item['ยกยอดมา']}  รับ:${item['รับ']}  เบิก:${item['เบิก']}  คงเหลือ:${item['คงเหลือ']}`;
+          const detail = `ยกมา:${fmtNum(item['ยกยอดมา'])}  รับ:${fmtNum(item['รับ'])}  เบิก:${fmtNum(item['เบิก'])}  คงเหลือ:${fmtNum(item['คงเหลือ'])}`;
           const contents = [
             {
               type: 'text',
