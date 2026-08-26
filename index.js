@@ -38,7 +38,7 @@ async function readStockImages(images) {
 กติกาสำคัญ: ตารางนี้มีเส้นตีกรอบแบ่งแถวและคอลัมน์ชัดเจน ให้ไล่อ่านทีละแถวจากบนลงล่างอย่างเป็นระบบในแต่ละรูป ก่อนอ่านตัวเลขในแต่ละแถว ให้ระบุชื่อสินค้าของแถวนั้นก่อน แล้วค่อยลากสายตาไปทางขวาตามแนวเส้นตารางเดียวกันเพื่ออ่านตัวเลขแต่ละคอลัมน์ ห้ามข้ามไปอ่านตัวเลขจากแถวบนหรือแถวล่างเด็ดขาด นับจำนวนแถวทั้งหมดในแต่ละรูปก่อน แล้วให้แน่ใจว่าจำนวนรายการที่ตอบกลับตรงกับจำนวนแถวที่นับได้ อย่าเดาจากบริบทหรือความสมเหตุสมผลของตัวเลข ถ้าช่องไหนว่างเปล่าไม่มีตัวเลขเขียนไว้ ให้ใส่ 0 (ไม่ใช่ null) เพราะในฟอร์มนี้ช่องว่างหมายถึงไม่มีการเคลื่อนไหว
 
 ตอบกลับเป็น JSON array เท่านั้น รวมทุกรูปไว้ใน array เดียว ไม่ต้องมีคำอธิบายอื่นใดๆ ทั้งสิ้น รูปแบบแต่ละแถว:
-{"รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลข, "คงเหลือ": ตัวเลข}`;
+{"รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "รวมยอด": ตัวเลข, "เบิก": ตัวเลข, "คงเหลือ": ตัวเลข}`;
 
   const content = [];
   images.forEach((img, idx) => {
@@ -56,16 +56,20 @@ async function readStockImages(images) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-5',
-      max_tokens: 8000,
+      max_tokens: 16000,
       messages: [{ role: 'user', content }]
     })
   });
 
   const data = await res.json();
+  console.log('stop_reason:', data.stop_reason, '| usage:', JSON.stringify(data.usage));
   console.log('Anthropic API raw response:', JSON.stringify(data).slice(0, 500));
   if (!data.content) {
     console.error('Anthropic API error:', JSON.stringify(data));
     throw new Error('อ่านรูปไม่สำเร็จ');
+  }
+  if (data.stop_reason === 'max_tokens') {
+    console.warn('⚠️ คำตอบถูกตัดเพราะเกิน max_tokens คำตอบอาจไม่สมบูรณ์');
   }
   return data.content.map(b => b.text || '').join('');
 }
@@ -79,19 +83,114 @@ function extractJsonArray(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
-// ตอบข้อความกลับไปใน LINE
-async function replyToLine(replyToken, text) {
-  await fetch('https://api.line.me/v2/bot/message/reply', {
+// ตรวจสอบสูตร: ยกยอดมา+รับ = รวมยอด และ รวมยอด-เบิก = คงเหลือ
+// คืนค่า item เดิม พร้อมเพิ่ม field "ผิดปกติ" (true/false) และ "เหตุผล" (คำอธิบายสั้นๆ)
+function validateItem(item) {
+  const yok = Number(item['ยกยอดมา']) || 0;
+  const rap = Number(item['รับ']) || 0;
+  const ruam = Number(item['รวมยอด']) || 0;
+  const bik = Number(item['เบิก']) || 0;
+  const kong = Number(item['คงเหลือ']) || 0;
+
+  const problems = [];
+  if (yok + rap !== ruam) {
+    problems.push(`ยกยอดมา(${yok})+รับ(${rap})=${yok + rap} แต่รวมยอดเขียน ${ruam}`);
+  }
+  if (ruam - bik !== kong) {
+    problems.push(`รวมยอด(${ruam})-เบิก(${bik})=${ruam - bik} แต่คงเหลือเขียน ${kong}`);
+  }
+
+  return { ...item, ผิดปกติ: problems.length > 0, เหตุผล: problems.join(' / ') };
+}
+
+// สร้าง Flex Message แสดงรายการทั้งหมด แถวไหนสูตรไม่ตรงจะขึ้นตัวหนังสือสีแดง
+// แบ่งเป็นหลายบับเบิล (การ์ด) บับเบิลละไม่เกิน 20 แถว รวมเป็น carousel เดียว
+function buildValidationFlex(items) {
+  const chunkSize = 20;
+  const chunks = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    chunks.push(items.slice(i, i + chunkSize));
+  }
+
+  const bubbles = chunks.map((chunk, chunkIdx) => ({
+    type: 'bubble',
+    size: 'giga',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: [
+        {
+          type: 'text',
+          text: `รายการที่ ${chunkIdx * chunkSize + 1}-${chunkIdx * chunkSize + chunk.length}`,
+          weight: 'bold',
+          size: 'sm',
+          color: '#888888'
+        },
+        { type: 'separator', margin: 'sm' },
+        ...chunk.map(item => {
+          const label = item['ผิดปกติ']
+            ? `⚠️ ${item['ลำดับ']}. ${item['สินค้า']}`
+            : `${item['ลำดับ']}. ${item['สินค้า']}`;
+          const detail = `ยกมา:${item['ยกยอดมา']} + รับ:${item['รับ']} = รวม:${item['รวมยอด']}  |  รวม − เบิก:${item['เบิก']} = คงเหลือ:${item['คงเหลือ']}`;
+          const contents = [
+            {
+              type: 'text',
+              text: label,
+              wrap: true,
+              size: 'sm',
+              weight: 'bold',
+              color: item['ผิดปกติ'] ? '#FF0000' : '#111111'
+            },
+            {
+              type: 'text',
+              text: detail,
+              wrap: true,
+              size: 'xs',
+              color: item['ผิดปกติ'] ? '#FF0000' : '#666666'
+            }
+          ];
+          if (item['ผิดปกติ']) {
+            contents.push({
+              type: 'text',
+              text: item['เหตุผล'],
+              wrap: true,
+              size: 'xxs',
+              color: '#FF0000'
+            });
+          }
+          return { type: 'box', layout: 'vertical', margin: 'md', contents };
+        })
+      ]
+    }
+  }));
+
+  const problemCount = items.filter(i => i['ผิดปกติ']).length;
+  const altText = problemCount > 0
+    ? `อ่านได้ ${items.length} รายการ พบ ${problemCount} รายการที่ยอดไม่ตรง กรุณาเช็ค`
+    : `อ่านได้ ${items.length} รายการ ยอดตรงกันทุกแถว`;
+
+  return {
+    type: 'flex',
+    altText,
+    contents: { type: 'carousel', contents: bubbles }
+  };
+}
+
+// ส่งข้อความกลับไปใน LINE รองรับทั้งข้อความธรรมดาและ Flex Message
+async function replyToLine(replyToken, message) {
+  const messages = typeof message === 'string' ? [{ type: 'text', text: message }] : [message];
+  const lineRes = await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${LINE_TOKEN}`
     },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: 'text', text }]
-    })
+    body: JSON.stringify({ replyToken, messages })
   });
+  if (!lineRes.ok) {
+    console.error('LINE reply error:', await lineRes.text());
+  }
 }
 
 app.post('/webhook', async (req, res) => {
@@ -116,21 +215,16 @@ app.post('/webhook', async (req, res) => {
     const resultJsonText = await readStockImages(images);
     console.log('ผลลัพธ์:', resultJsonText);
 
-    let displayText;
+    let replyMessage;
     try {
-      const items = extractJsonArray(resultJsonText);
-      const multiImage = imageEvents.length > 1;
-      displayText = 'อ่านได้ดังนี้ (เช็คให้ตรงก่อนนะครับ):\n\n' +
-        items.map(i => {
-          const tag = multiImage ? `[รูป ${i['รูปที่']}] ` : '';
-          return `${tag}${i['ลำดับ']}. ${i['สินค้า']} | รับ: ${i['รับ']} | เบิก: ${i['เบิก']} | คงเหลือ: ${i['คงเหลือ']}`;
-        }).join('\n');
+      const items = extractJsonArray(resultJsonText).map(validateItem);
+      replyMessage = buildValidationFlex(items);
     } catch (e) {
       console.error('parse JSON ไม่ผ่าน:', e.message);
-      displayText = 'อ่านได้ผลลัพธ์นี้ (รูปแบบไม่ตรง JSON เช็คด้วยตนเอง):\n' + resultJsonText;
+      replyMessage = 'อ่านได้ผลลัพธ์นี้ (รูปแบบไม่ตรง JSON เช็คด้วยตนเอง):\n' + resultJsonText;
     }
 
-    await replyToLine(replyToken, displayText);
+    await replyToLine(replyToken, replyMessage);
   } catch (err) {
     console.error('เกิดข้อผิดพลาด:', err.message);
     await replyToLine(replyToken, 'ขออภัย อ่านรูปไม่สำเร็จ ลองถ่ายใหม่อีกครั้งครับ');
