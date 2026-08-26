@@ -1,0 +1,12 @@
+{
+  "name": "line-stock-bot",
+  "version": "1.0.0",
+  "description": "Webhook server for LINE stock management bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
