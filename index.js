@@ -38,7 +38,8 @@ async function readStockImage(base64, mediaType) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-5',
-      max_tokens: 1024,
+      max_tokens: 4096,
+      thinking: { type: 'disabled' },
       messages: [{
         role: 'user',
         content: [
@@ -50,6 +51,7 @@ async function readStockImage(base64, mediaType) {
   });
 
   const data = await res.json();
+  console.log('Anthropic API raw response:', JSON.stringify(data).slice(0, 500));
   if (!data.content) {
     console.error('Anthropic API error:', JSON.stringify(data));
     throw new Error('อ่านรูปไม่สำเร็จ');
