@@ -1,25 +1,23 @@
-
-Index.js · TXT
 // เซิร์ฟเวอร์รับ Webhook จาก LINE + อ่านรูปด้วย Claude (OCR)
 // ขั้นนี้: รับรูป -> ดึงไฟล์จริงจาก LINE -> ส่งให้ Claude อ่าน -> ตอบสรุปกลับไปให้เช็ค
 // ยังไม่บันทึกลง Google Sheet (ขั้นถัดไป)
- 
+
 const express = require('express');
 const app = express();
- 
+
 app.use(express.json());
- 
+
 // ค่าลับ ดึงมาจาก Environment Variables (ตั้งใน Render) ห้ามเขียนค่าจริงในไฟล์นี้เด็ดขาด
 const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const LINE_PUSH_TARGET = process.env.LINE_PUSH_TARGET; // userId หรือ groupId ที่จะส่งสรุปให้
 const CRON_SECRET = process.env.CRON_SECRET; // กันคนนอกยิง endpoint นี้เล่น
- 
+
 // ถ้ามี error หลุดออกมาโดยไม่มีใครรับ Node จะปิดโปรเซสทิ้ง ทำให้บอทตายเงียบ ๆ
 // ดักไว้ตรงนี้เพื่อให้เซิร์ฟเวอร์อยู่ต่อและเห็นสาเหตุใน Logs
 process.on('unhandledRejection', err => console.error('[unhandledRejection]', err));
- 
+
 // fetch ของ Node ไม่มี timeout ในตัว ถ้าปลายทางค้าง คำขอจะค้างตลอดกาล
 async function fetchWithTimeout(url, options = {}, timeoutMs = 120000) {
   const controller = new AbortController();
@@ -30,7 +28,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 120000) {
     clearTimeout(timer);
   }
 }
- 
+
 // เชื่อมต่อ Google Sheets ด้วย Service Account
 const { google } = require('googleapis');
 let sheetsClient = null;
@@ -44,7 +42,7 @@ function getSheetsClient() {
   sheetsClient = google.sheets({ version: 'v4', auth });
   return sheetsClient;
 }
- 
+
 // ดึงชื่อชีตจริงจากไฟล์ (กันปัญหาชื่อชีตไม่ตรงเป๊ะกับที่ hardcode ไว้ เช่น เคสตัวพิมพ์ใหญ่เล็ก/ช่องว่าง)
 let cachedTitles = null;
 async function resolveSheetTitles() {
@@ -56,7 +54,7 @@ async function resolveSheetTitles() {
   });
   const titles = meta.data.sheets.map(s => s.properties.title);
   const find = (needle) => titles.find(t => t.trim().toLowerCase() === needle.toLowerCase());
- 
+
   const movementLogTitle = find('Movement Log');
   const masterTitle = find('Master');
   if (!movementLogTitle) {
@@ -69,7 +67,7 @@ async function resolveSheetTitles() {
   console.log('พบชื่อชีตจริง:', JSON.stringify(cachedTitles));
   return cachedTitles;
 }
- 
+
 // ใส่เครื่องหมายคำพูดครอบชื่อชีตเสมอ (กันกรณีชื่อมีช่องว่างหรืออักขระพิเศษ)
 function quoteSheetName(name) {
   return `'${name.replace(/'/g, "''")}'`;
@@ -95,7 +93,7 @@ async function getMasterLookup() {
   });
   return { masterTitle, nameToRow, nameToStock };
 }
- 
+
 // เช็คว่า "ยกยอดมา" ที่เขียนวันนี้ ตรงกับ "คงเหลือ" ที่บันทึกไว้จากครั้งก่อน (เมื่อวาน) หรือไม่
 // ถ้าไม่มีข้อมูลเก่าเลย (สินค้าใหม่/ยังไม่เคยบันทึก) จะข้ามการเช็คนี้ไป
 function applyCrossDayCheck(item, nameToStock) {
@@ -107,7 +105,7 @@ function applyCrossDayCheck(item, nameToStock) {
   const prev = Number(prevRaw);
   const yok = Number(item['ยกยอดมา']) || 0;
   if (isNaN(prev) || prev === yok) return item;
- 
+
   const note = `ยกยอดมาที่เขียน(${fmtNum(yok)}) ไม่ตรงกับคงเหลือครั้งก่อน(${fmtNum(prev)})`;
   return {
     ...item,
@@ -116,27 +114,27 @@ function applyCrossDayCheck(item, nameToStock) {
     เหตุผล: item['เหตุผล'] ? item['เหตุผล'] + ' | ' + note : note
   };
 }
- 
+
 // ลบแถวเก่าใน Movement Log ที่เป็นของ "วันนี้" และมี stk ตรงกับที่กำลังจะบันทึกใหม่
 // กันกรณีถ่ายรูปฟอร์มเดิมซ้ำในวันเดียวกัน ไม่ให้ประวัติซ้ำซ้อน (แทนที่ด้วยข้อมูลล่าสุดแทน)
 async function removeExistingTodayEntries(stkCodes) {
   if (stkCodes.length === 0) return;
   const sheets = getSheetsClient();
   const { movementLogTitle } = await resolveSheetTitles();
- 
+
   // ต้องใช้ sheetId (ตัวเลข ไม่ใช่ชื่อ) สำหรับคำสั่งลบแถว
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID, fields: 'sheets.properties' });
   const sheetProps = meta.data.sheets.find(s => s.properties.title === movementLogTitle)?.properties;
   if (!sheetProps) return;
   const sheetId = sheetProps.sheetId;
- 
+
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: `${quoteSheetName(movementLogTitle)}!A:B` // A=วันที่เวลา, B=stk
   });
   const rows = res.data.values || [];
   const todayStr = new Date().toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok' });
- 
+
   // หา index แถว (0-based ตรงกับตำแหน่งจริงในชีต เพราะ range เริ่มจาก A1 พอดี) ที่ต้องลบ
   const rowIndicesToDelete = [];
   rows.forEach((row, idx) => {
@@ -148,7 +146,7 @@ async function removeExistingTodayEntries(stkCodes) {
     }
   });
   if (rowIndicesToDelete.length === 0) return;
- 
+
   // ลบจากแถวล่างขึ้นบน (index มากไปน้อย) กันปัญหาแถวเลื่อนตำแหน่งระหว่างลบ
   rowIndicesToDelete.sort((a, b) => b - a);
   const requests = rowIndicesToDelete.map(idx => ({
@@ -156,14 +154,14 @@ async function removeExistingTodayEntries(stkCodes) {
       range: { sheetId, dimension: 'ROWS', startIndex: idx, endIndex: idx + 1 }
     }
   }));
- 
+
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
     requestBody: { requests }
   });
   console.log(`ลบแถวเก่าของวันนี้ที่ซ้ำ stk (${stkCodes.join(', ')}) ออก ${rowIndicesToDelete.length} แถว`);
 }
- 
+
 async function appendMovementLog(items) {
   const sheets = getSheetsClient();
   const { movementLogTitle } = await resolveSheetTitles();
@@ -179,14 +177,14 @@ async function appendMovementLog(items) {
     requestBody: { values: rows }
   });
 }
- 
+
 // อัปเดตคอลัมน์ "คงเหลือปัจจุบัน" (คอลัมน์ G) ในชีต Master ให้ตรงกับยอดล่าสุดของวันนี้
 // จับคู่ด้วยชื่อสินค้า (คอลัมน์ B) ถ้าหาไม่เจอในชีต Master จะข้ามและแจ้งใน log
 // รับ lookup ที่ fetch ไว้ล่วงหน้าแล้ว (จาก getMasterLookup) กันการดึงข้อมูลซ้ำซ้อน
 async function updateMasterCurrentStock(items, lookup) {
   const sheets = getSheetsClient();
   const { masterTitle, nameToRow } = lookup;
- 
+
   const updates = [];
   const unmatched = [];
   for (const item of items) {
@@ -198,7 +196,7 @@ async function updateMasterCurrentStock(items, lookup) {
       unmatched.push(name);
     }
   }
- 
+
   if (updates.length > 0) {
     await sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SPREADSHEET_ID,
@@ -210,7 +208,7 @@ async function updateMasterCurrentStock(items, lookup) {
   }
   return { updatedCount: updates.length, unmatched };
 }
- 
+
 // ดึงไฟล์รูปจริงจากเซิร์ฟเวอร์ LINE โดยใช้ messageId
 async function getLineImage(messageId) {
   const res = await fetchWithTimeout(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
@@ -225,7 +223,7 @@ async function getLineImage(messageId) {
   const mediaType = res.headers.get('content-type') || 'image/jpeg';
   return { base64, mediaType };
 }
- 
+
 // ส่งรูปให้ Claude อ่านตัวหนังสือ แล้วแปลงเป็นข้อมูลสต็อก
 // รับได้หลายรูปพร้อมกัน (images = array ของ {base64, mediaType})
 async function readStockImages(images) {
@@ -235,22 +233,22 @@ async function readStockImages(images) {
 3. "-เบิก" - จำนวนที่เบิกออกใช้วันนี้
 4. "คงเหลือ" - ยอดคงเหลือหลังหักเบิกแล้ว (คอลัมน์ขวาสุด)
 (ข้ามคอลัมน์ "รวมยอด" ไม่ต้องอ่าน)
- 
+
 กติกาสำคัญ: ตารางนี้มีเส้นตีกรอบแบ่งแถวและคอลัมน์ชัดเจน ให้ไล่อ่านทีละแถวจากบนลงล่างอย่างเป็นระบบในแต่ละรูป ก่อนอ่านตัวเลขในแต่ละแถว ให้ระบุชื่อสินค้าของแถวนั้นก่อน แล้วค่อยลากสายตาไปทางขวาตามแนวเส้นตารางเดียวกันเพื่ออ่านตัวเลขแต่ละคอลัมน์ ห้ามข้ามไปอ่านตัวเลขจากแถวบนหรือแถวล่างเด็ดขาด นับจำนวนแถวทั้งหมดในแต่ละรูปก่อน แล้วให้แน่ใจว่าจำนวนรายการที่ตอบกลับตรงกับจำนวนแถวที่นับได้ อย่าเดาจากบริบทหรือความสมเหตุสมผลของตัวเลข
- 
+
 สำหรับคอลัมน์ "ยกยอดมา", "รับ", "คงเหลือ": ถ้าช่องว่างเปล่าไม่มีตัวเลขเขียนไว้ ให้ใส่ 0
 สำหรับคอลัมน์ "เบิก" เท่านั้น: ต้องแยกแยะให้ชัดระหว่างช่องที่ไม่มีลายมือเขียนอะไรเลย (ว่างจริง) กับช่องที่เขียนเลข 0 ไว้ ถ้าไม่มีลายมือเขียนอะไรในช่องเบิกเลย ให้ใส่ค่า null (ห้ามใส่ 0 แทน) ถ้ามีคนเขียนตัวเลขไว้จริง (รวมถึงเลข 0) ให้ใส่ตัวเลขนั้นตามที่เขียนจริง
- 
+
 ตอบกลับเป็น JSON array เท่านั้น รวมทุกรูปไว้ใน array เดียว ไม่ต้องมีคำอธิบายอื่นใดๆ ทั้งสิ้น รูปแบบแต่ละแถว:
 {"stk": "รหัสฟอร์มเช่น STK04", "รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลขหรือnull, "คงเหลือ": ตัวเลข}`;
- 
+
   const content = [];
   images.forEach((img, idx) => {
     content.push({ type: 'text', text: `รูปที่ ${idx + 1}:` });
     content.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.base64 } });
   });
   content.push({ type: 'text', text: prompt });
- 
+
   const t0 = Date.now();
   const res = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -266,7 +264,7 @@ async function readStockImages(images) {
     })
   }, 150000);
   console.log(`[ai] อ่านรูปเสร็จใน ${Date.now() - t0}ms`);
- 
+
   const data = await res.json();
   console.log('stop_reason:', data.stop_reason, '| usage:', JSON.stringify(data.usage));
   console.log('Anthropic API raw response:', JSON.stringify(data).slice(0, 500));
@@ -279,7 +277,7 @@ async function readStockImages(images) {
   }
   return data.content.map(b => b.text || '').join('');
 }
- 
+
 // ตัดส่วนที่ไม่ใช่ JSON ออก เผื่อ Claude ห่อด้วย ```json ... ``` หรือมีข้อความอื่นปนมา
 function extractJsonArray(text) {
   const cleaned = text.replace(/```json|```/g, '').trim();
@@ -288,14 +286,14 @@ function extractJsonArray(text) {
   if (start === -1 || end === -1) throw new Error('ไม่พบ JSON array ในคำตอบ');
   return JSON.parse(cleaned.slice(start, end + 1));
 }
- 
+
 // แสดงตัวเลข: ถ้าเป็นจำนวนเต็มคงเดิม ถ้ามีทศนิยมให้ปัดเหลือ 2 ตำแหน่ง
 function fmtNum(n) {
   const num = Number(n);
   if (isNaN(num)) return n;
   return Number.isInteger(num) ? String(num) : num.toFixed(2);
 }
- 
+
 // เช็คและปรับปรุงค่า "เบิก" จาก 3 ค่าที่ยึดตามกระดาษ (ห้ามแก้): ยกยอดมา, รับ, คงเหลือ
 // สูตร: ยกยอดมา + รับ - เบิก = คงเหลือ  =>  เบิกที่ถูกต้อง = ยกยอดมา + รับ - คงเหลือ
 function reconcileItem(item) {
@@ -303,18 +301,18 @@ function reconcileItem(item) {
   const rap = Number(item['รับ']) || 0;
   const kong = Number(item['คงเหลือ']) || 0;
   const correctBik = yok + rap - kong;
- 
+
   const writtenBik = item['เบิก']; // null = ช่องว่างจริง, ตัวเลข = มีคนเขียนไว้
   const wasBlank = writtenBik === null || writtenBik === undefined;
   const mismatch = !wasBlank && Number(writtenBik) !== correctBik;
- 
+
   let เหตุผล = '';
   if (wasBlank) {
     เหตุผล = `ช่องเบิกว่าง คำนวณให้จาก ${fmtNum(yok)}+${fmtNum(rap)}-${fmtNum(kong)} = ${fmtNum(correctBik)}`;
   } else if (mismatch) {
     เหตุผล = `เบิกเดิมเขียน ${fmtNum(writtenBik)} แต่คำนวณจาก ${fmtNum(yok)}+${fmtNum(rap)}-${fmtNum(kong)} ได้ ${fmtNum(correctBik)} (แก้ไขแล้ว)`;
   }
- 
+
   return {
     ...item,
     เบิก: wasBlank || mismatch ? correctBik : Number(writtenBik),
@@ -323,7 +321,7 @@ function reconcileItem(item) {
     เหตุผล
   };
 }
- 
+
 // สร้าง Flex Carousel: 1 ข้อความ มีหลายการ์ดเลื่อนดู
 // 1 รูปที่ส่งเข้ามา = 1 การ์ดเป๊ะๆ (เรียงตามลำดับรูปที่ส่ง) + การ์ดสุดท้ายคือสรุปสั่งซื้อ
 function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
@@ -333,7 +331,7 @@ function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
     if (diff !== 0) return diff;
     return (Number(a['ลำดับ']) || 0) - (Number(b['ลำดับ']) || 0);
   });
- 
+
   // จัดกลุ่มตาม "รูปที่" — 1 กลุ่ม = 1 รูป = 1 การ์ด (ไม่รวมกันแม้ stk จะซ้ำกันก็ตาม)
   const groups = [];
   let current = null;
@@ -345,7 +343,7 @@ function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
     }
     current.items.push(item);
   }
- 
+
   // สร้างการ์ด (บับเบิล) 1 ใบต่อ 1 STK
   const stkBubbles = groups.map(group => {
     const itemBoxes = group.items.map(item => {
@@ -381,7 +379,7 @@ function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
       }
     };
   });
- 
+
   // การ์ดสุดท้าย: สรุปสั่งซื้อ แยกตามซัพพลายเออร์
   const orderGroups = {};
   summaryRows.forEach(row => {
@@ -431,7 +429,7 @@ function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
       ]
     }
   };
- 
+
   const problemCount = items.filter(i => i['ผิดปกติ']).length;
   const filledCount = items.filter(i => i['autoFilled']).length;
   const parts = [`อ่านได้ ${items.length} รายการ จาก ${groups.length} รูป`];
@@ -440,14 +438,14 @@ function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
   if (saveResult.updatedCount !== undefined) parts.push(`บันทึกลง Sheet แล้ว ${saveResult.updatedCount} รายการ`);
   if (summaryRows.length > 0) parts.push(`ต้องสั่งเพิ่ม ${summaryRows.length} รายการ`);
   const altText = parts.join(' | ');
- 
+
   return {
     type: 'flex',
     altText,
     contents: { type: 'carousel', contents: [...stkBubbles, orderBubble] }
   };
 }
- 
+
 // ส่งข้อความกลับไปใน LINE รองรับทั้งข้อความธรรมดาและ Flex Message
 async function replyToLine(replyToken, message) {
   let messages;
@@ -468,20 +466,20 @@ async function replyToLine(replyToken, message) {
   }
   return true;
 }
- 
+
 // LINE ให้ใช้ replyToken ได้ครั้งเดียวและมีอายุราว 1 นาทีนับจากที่ webhook เข้ามา
 // งานอ่านรูป + บันทึก Sheet มักใช้เวลานานกว่านั้น พอ reply ไม่ผ่านผู้ใช้จะไม่ได้อะไรกลับเลย
 // ฟังก์ชันนี้จึงเปลี่ยนไปส่งแบบ push ให้อัตโนมัติ เพื่อให้ข้อความถึงมือผู้ใช้เสมอ
 const REPLY_TOKEN_BUDGET_MS = 55000;
- 
+
 function replyTarget(event) {
   const src = (event && event.source) || {};
   return src.groupId || src.roomId || src.userId || LINE_PUSH_TARGET;
 }
- 
+
 async function deliverToLine(replyToken, target, message, startedAt) {
   const elapsed = Date.now() - startedAt;
- 
+
   if (elapsed < REPLY_TOKEN_BUDGET_MS) {
     if (await replyToLine(replyToken, message)) {
       console.log(`[ส่งกลับ] reply สำเร็จ ใช้เวลารวม ${elapsed}ms`);
@@ -491,7 +489,7 @@ async function deliverToLine(replyToken, target, message, startedAt) {
   } else {
     console.warn(`[ส่งกลับ] ใช้เวลา ${elapsed}ms เกินอายุ replyToken ข้ามไปใช้ push เลย`);
   }
- 
+
   if (!target) {
     console.error('[ส่งกลับ] ไม่รู้ปลายทาง ส่ง push ไม่ได้ ข้อความหายไป');
     return;
@@ -499,7 +497,7 @@ async function deliverToLine(replyToken, target, message, startedAt) {
   await pushToLine(target, message);
   console.log(`[ส่งกลับ] push สำเร็จ ใช้เวลารวม ${Date.now() - startedAt}ms`);
 }
- 
+
 // ส่งข้อความแบบ push (ไม่ผูกกับ replyToken) ใช้สำหรับส่งสรุปตามเวลาที่ตั้งไว้
 async function pushToLine(to, message) {
   // เดิมถ้าส่ง array เข้ามาจะถูกห่อซ้อนอีกชั้นเป็น [[...]] แล้ว LINE ปฏิเสธ
@@ -508,7 +506,7 @@ async function pushToLine(to, message) {
   if (typeof message === 'string') messages = [{ type: 'text', text: message }];
   else if (Array.isArray(message)) messages = message;
   else messages = [message];
- 
+
   const lineRes = await fetchWithTimeout('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
     headers: {
@@ -522,7 +520,7 @@ async function pushToLine(to, message) {
     throw new Error('ส่งข้อความ push ไม่สำเร็จ');
   }
 }
- 
+
 // หาชื่อชีต "สรุปสั่งซื้อ" จริงจากไฟล์ (เผื่อสะกด/เว้นวรรคต่างเล็กน้อย)
 let cachedSummaryTitle = null;
 async function resolveSummaryTitle() {
@@ -540,7 +538,7 @@ async function resolveSummaryTitle() {
   cachedSummaryTitle = found;
   return found;
 }
- 
+
 // ดึงข้อมูลจากชีตสรุปสั่งซื้อ (ผลลัพธ์จากสูตร QUERY) คืนเป็น array ของแถว
 async function fetchSummaryRows() {
   const sheets = getSheetsClient();
@@ -551,15 +549,15 @@ async function fetchSummaryRows() {
   });
   return res.data.values || [];
 }
- 
+
 // สร้าง Flex Message สรุปสั่งซื้อ รวมทุกซัพพลายเออร์ไว้ในการ์ดเดียว (bubble เดียว) จัดเป็นหมวดๆ ตามซัพพลายเออร์
 function buildSupplierSummaryFlex(rows) {
   const todayStr = new Date().toLocaleDateString('th-TH');
- 
+
   if (rows.length === 0) {
     return { type: 'text', text: `📦 สรุปสต็อกวันนี้ (${todayStr})\n\nสต็อกทุกอย่างเพียงพอ ไม่มีรายการที่ต้องสั่งเพิ่มครับ 👍` };
   }
- 
+
   // จัดกลุ่มตามซัพพลายเออร์ (คอลัมน์แรก)
   const groups = {};
   rows.forEach(row => {
@@ -567,7 +565,7 @@ function buildSupplierSummaryFlex(rows) {
     if (!groups[supplier]) groups[supplier] = [];
     groups[supplier].push(row);
   });
- 
+
   const supplierSections = Object.entries(groups).flatMap(([supplier, items], groupIdx) => {
     const header = {
       type: 'box',
@@ -590,10 +588,10 @@ function buildSupplierSummaryFlex(rows) {
     }));
     return [header, ...itemBoxes];
   });
- 
+
   const totalItems = rows.length;
   const supplierCount = Object.keys(groups).length;
- 
+
   return {
     type: 'flex',
     altText: `📦 สรุปสต็อกวันนี้: ต้องสั่งเพิ่ม ${totalItems} รายการ จาก ${supplierCount} ซัพพลายเออร์`,
@@ -614,58 +612,58 @@ function buildSupplierSummaryFlex(rows) {
     }
   };
 }
- 
+
 app.post('/webhook', async (req, res) => {
   // ตอบ LINE ก่อนทันที ไม่งั้นถ้าประมวลผลนาน LINE จะคิดว่า error
   res.status(200).send('OK');
- 
+
   const events = req.body.events || [];
   // log แหล่งที่มาของทุกข้อความไว้ ใช้หา userId/groupId สำหรับส่งข้อความแบบ push
   events.forEach(e => console.log('source:', JSON.stringify(e.source)));
- 
+
   const imageEvents = events.filter(e => e.type === 'message' && e.message.type === 'image');
   if (imageEvents.length === 0) return;
- 
+
   // ใช้ replyToken ของรูปสุดท้ายในชุดนี้ ส่งข้อความสรุปกลับไปครั้งเดียว
   const lastEvent = imageEvents[imageEvents.length - 1];
   const replyToken = lastEvent.replyToken;
   const target = replyTarget(lastEvent);
   // จับเวลาจากตอนที่ webhook เข้ามา เพื่อรู้ว่า replyToken ยังใช้ได้อยู่ไหมตอนจะตอบ
   const startedAt = Date.now();
- 
+
   try {
     console.log(`กำลังดึงรูปทั้งหมด ${imageEvents.length} รูป...`);
     const images = [];
     for (const event of imageEvents) {
       images.push(await getLineImage(event.message.id));
     }
- 
+
     console.log('กำลังส่งให้ AI อ่านพร้อมกัน...');
     const resultJsonText = await readStockImages(images);
     console.log('ผลลัพธ์:', resultJsonText);
- 
+
     let replyMessage;
     try {
       const items = extractJsonArray(resultJsonText).map(reconcileItem);
- 
+
       console.log('กำลังดึงข้อมูล Master เพื่อเช็คข้ามวัน...');
       const lookup = await getMasterLookup();
       const checkedItems = items.map(item => applyCrossDayCheck(item, lookup.nameToStock));
- 
+
       console.log('กำลังบันทึกลง Google Sheet...');
       const stkCodes = [...new Set(checkedItems.map(i => i['stk']).filter(Boolean))];
       await removeExistingTodayEntries(stkCodes);
       await appendMovementLog(checkedItems);
       const { updatedCount, unmatched } = await updateMasterCurrentStock(checkedItems, lookup);
       console.log(`บันทึกสำเร็จ: อัปเดตยอดคงเหลือ ${updatedCount} รายการ, หาไม่เจอ ${unmatched.length} รายการ`);
- 
+
       let summaryRows = [];
       try {
         summaryRows = await fetchSummaryRows();
       } catch (e) {
         console.warn('⚠️ ดึงสรุปสั่งซื้อไม่สำเร็จ (แสดงการ์ดโดยไม่มีส่วนสั่งซื้อ):', e.message);
       }
- 
+
       const validationCard = buildValidationFlex(checkedItems, { updatedCount, unmatched }, summaryRows);
       replyMessage = [validationCard];
     } catch (e) {
@@ -673,7 +671,7 @@ app.post('/webhook', async (req, res) => {
       const raw = 'บันทึกลง Sheet ไม่สำเร็จ: ' + e.message + '\n\nข้อมูลที่อ่านได้ (ตัดบางส่วน):\n' + resultJsonText;
       replyMessage = raw.length > 4900 ? raw.slice(0, 4900) + '\n...(ตัดเพราะยาวเกิน)' : raw;
     }
- 
+
     await deliverToLine(replyToken, target, replyMessage, startedAt);
   } catch (err) {
     console.error('เกิดข้อผิดพลาด:', err.stack || err.message);
@@ -684,16 +682,16 @@ app.post('/webhook', async (req, res) => {
     }
   }
 });
- 
+
 app.get('/', (req, res) => {
   res.send('LINE Stock Bot server is running');
 });
- 
+
 // ปลายทางสำหรับตัวปลุกภายนอก ตอบสั้นและเร็วที่สุด ไม่แตะ Google Sheet
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, uptimeSec: Math.round(process.uptime()) });
 });
- 
+
 // endpoint นี้ถูกเรียกโดยตัวตั้งเวลาภายนอกทุกเช้า เพื่อส่งสรุปสั่งซื้อเข้า LINE
 // ป้องกันด้วย key ลับ กันคนนอกยิงเล่น: /cron/daily-summary?key=xxxxx
 app.get('/cron/daily-summary', async (req, res) => {
@@ -701,7 +699,7 @@ app.get('/cron/daily-summary', async (req, res) => {
     return res.status(403).send('Forbidden');
   }
   res.status(200).send('OK, sending...'); // ตอบก่อนเลย กันตัวตั้งเวลา timeout
- 
+
   try {
     console.log('เริ่มส่งสรุปสั่งซื้อประจำวัน...');
     const rows = await fetchSummaryRows();
@@ -712,9 +710,8 @@ app.get('/cron/daily-summary', async (req, res) => {
     console.error('ส่งสรุปสั่งซื้อล้มเหลว:', err.message);
   }
 });
- 
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
- 
