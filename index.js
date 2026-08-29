@@ -1,580 +1,842 @@
-/***************************************************************
- * ระบบจัดการสต็อกสินค้าด้วยการสแกนบาร์โค้ด — ฝั่ง Google Apps Script
- * เวอร์ชัน 2 : เพิ่มซัพพลายเออร์ + คำนวณรายการสั่งซื้ออัตโนมัติ
- *
- * ติดตั้งครั้งแรก  : รันฟังก์ชัน setupSheets
- * อัปเกรดจากเวอร์ชันเดิม (มีข้อมูลอยู่แล้ว) : รันฟังก์ชัน upgradeSheets
- *   — upgradeSheets จะไม่ลบข้อมูลเดิม เพิ่มเฉพาะคอลัมน์ใหม่และสูตร
- ***************************************************************/
+// เซิร์ฟเวอร์รับ Webhook จาก LINE + อ่านรูปด้วย Claude (OCR)
+// ขั้นนี้: รับรูป -> ดึงไฟล์จริงจาก LINE -> ส่งให้ Claude อ่าน -> ตอบสรุปกลับไปให้เช็ค
+// ยังไม่บันทึกลง Google Sheet (ขั้นถัดไป)
 
-/** รหัสลับ – ต้องตรงกับที่ตั้งในหน้าสแกนบนมือถือ */
-var SECRET = 'CHANGE-ME-1234';
+const express = require('express');
+const app = express();
 
-var SH_PRODUCTS = 'Products';
-var SH_TRANS    = 'Transactions';
-var SH_STOCK    = 'Stock';
-var TZ          = 'Asia/Bangkok';
+app.use(express.json());
 
-/* Products : A บาร์โค้ด | B ชื่อสินค้า | C หน่วยนับ | D ขั้นต่ำ | E สั่งเติมถึง
- *            F ขนาดบรรจุ | G ซัพพลายเออร์ | H หน่วยสั่งซื้อ
- *
- * หน่วยนับ = หน่วยที่ใช้นับสต็อกและสแกน (เช่น ชิ้น)
- * หน่วยสั่งซื้อ = หน่วยที่ใช้สั่งกับซัพพลายเออร์ (เช่น ลัง)
- * ขนาดบรรจุ = 1 หน่วยสั่งซื้อ มีกี่หน่วยนับ (เช่น 12 = ลังละ 12 ชิ้น)
- */
-var P_COLS = 8;
+// ค่าลับ ดึงมาจาก Environment Variables (ตั้งใน Render) ห้ามเขียนค่าจริงในไฟล์นี้เด็ดขาด
+const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const LINE_PUSH_TARGET = process.env.LINE_PUSH_TARGET; // userId หรือ groupId ที่จะส่งสรุปให้
+const CRON_SECRET = process.env.CRON_SECRET; // กันคนนอกยิง endpoint นี้เล่น
 
-/* =============================================================
- *  API  (เรียกผ่าน JSONP จากหน้าเว็บ — ไม่ติดปัญหา CORS)
- * ============================================================= */
+// ถ้ามี error หลุดออกมาโดยไม่มีใครรับ Node จะปิดโปรเซสทิ้ง ทำให้บอทตายเงียบ ๆ
+// ดักไว้ตรงนี้เพื่อให้เซิร์ฟเวอร์อยู่ต่อและเห็นสาเหตุใน Logs
+process.on('unhandledRejection', err => console.error('[unhandledRejection]', err));
 
-function doGet(e) {
-  var p = (e && e.parameter) ? e.parameter : {};
-  var out;
+// fetch ของ Node ไม่มี timeout ในตัว ถ้าปลายทางค้าง คำขอจะค้างตลอดกาล
+async function fetchWithTimeout(url, options = {}, timeoutMs = 120000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    if (p.token !== SECRET) throw new Error('รหัสลับไม่ถูกต้อง');
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-    switch (p.action) {
-      case 'ping':       out = { ok: true, msg: 'เชื่อมต่อสำเร็จ', sheet: SpreadsheetApp.getActive().getName(), version: 4 }; break;
-      case 'products':   out = { ok: true, products: getProducts_() }; break;
-      case 'lookup':     out = { ok: true, product: lookupProduct_(String(p.barcode || '').trim()) }; break;
-      case 'addProduct': out = { ok: true, product: upsertProduct_(p) }; break;
-      case 'save':       out = { ok: true, saved: saveTransaction_(p) }; break;
-      case 'saveBatch':  out = { ok: true, saved: saveBatch_(p.items) }; break;
-      case 'summary':    out = { ok: true, rows: getSummary_() }; break;
-      case 'reorder':    out = { ok: true, groups: getReorder_() }; break;
-      case 'recent':     out = { ok: true, rows: getRecent_(Number(p.limit || 20)) }; break;
-      default: throw new Error('ไม่รู้จักคำสั่ง: ' + p.action);
+// เชื่อมต่อ Google Sheets ด้วย Service Account
+const { google } = require('googleapis');
+let sheetsClient = null;
+function getSheetsClient() {
+  if (sheetsClient) return sheetsClient;
+  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets']
+  });
+  sheetsClient = google.sheets({ version: 'v4', auth });
+  return sheetsClient;
+}
+
+// ดึงชื่อชีตจริงจากไฟล์ (กันปัญหาชื่อชีตไม่ตรงเป๊ะกับที่ hardcode ไว้ เช่น เคสตัวพิมพ์ใหญ่เล็ก/ช่องว่าง)
+let cachedTitles = null;
+async function resolveSheetTitles() {
+  if (cachedTitles) return cachedTitles;
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: SPREADSHEET_ID,
+    fields: 'sheets.properties.title'
+  });
+  const titles = meta.data.sheets.map(s => s.properties.title);
+  const find = (needle) => titles.find(t => t.trim().toLowerCase() === needle.toLowerCase());
+
+  const movementLogTitle = find('Movement Log');
+  const masterTitle = find('Master');
+  if (!movementLogTitle) {
+    throw new Error(`ไม่พบชีตชื่อ "Movement Log" ในไฟล์ Google Sheet (ชีตที่มีอยู่จริง: ${titles.join(', ')})`);
+  }
+  if (!masterTitle) {
+    throw new Error(`ไม่พบชีตชื่อ "Master" ในไฟล์ Google Sheet (ชีตที่มีอยู่จริง: ${titles.join(', ')})`);
+  }
+  cachedTitles = { movementLogTitle, masterTitle };
+  console.log('พบชื่อชีตจริง:', JSON.stringify(cachedTitles));
+  return cachedTitles;
+}
+
+// ใส่เครื่องหมายคำพูดครอบชื่อชีตเสมอ (กันกรณีชื่อมีช่องว่างหรืออักขระพิเศษ)
+function quoteSheetName(name) {
+  return `'${name.replace(/'/g, "''")}'`;
+}
+
+// ---------- จับคู่ชื่อสินค้าแบบยืดหยุ่น ----------
+// ชื่อที่อ่านจากลายมือในฟอร์ม กับชื่อในชีต Master มักไม่ตรงกันเป๊ะ
+// เว้นวรรคไม่เท่ากัน วรรณยุกต์หาย หรือสะกดเพี้ยนไปตัวสองตัว
+//
+// กติกาความปลอดภัยของทั้งหมดนี้: ถ้ามีสินค้าที่เข้าเค้าพอ ๆ กันมากกว่าหนึ่งตัว จะไม่เลือกเลย
+// เพราะจับผิดตัว = ยอดคงเหลือไปลงผิดสินค้า ซึ่งเสียหายกว่าการไม่อัปเดตแล้วแจ้งเตือน
+
+const THAI_MARKS = /[็-๎]/g; // ไม้ไต่คู้ วรรณยุกต์ทั้งสี่ ทัณฑฆาต นิคหิต ยามักการ
+
+function normalizeName(value) {
+  return String(value == null ? '' : value)
+    .normalize('NFC')
+    .replace(THAI_MARKS, '')                                   // ตัดวรรณยุกต์ทิ้ง
+    .replace(/\s/g, '')                                        // ตัดช่องว่างทุกชนิด
+    .replace(/[()[\]{}.,\-_/\\'"`~!@#$%^&*+=|?<>:;]/g, '')      // ตัดเครื่องหมายวรรคตอน
+    .toLowerCase();
+}
+
+// นับว่าต้องแก้กี่ตัวอักษรถึงจะกลายเป็นอีกคำหนึ่ง (Levenshtein)
+function editDistance(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
     }
-  } catch (err) {
-    out = { ok: false, error: String(err && err.message ? err.message : err) };
+    prev = cur;
   }
-  return reply_(out, p.callback);
+  return prev[b.length];
 }
 
-function doPost(e) {
-  var body = {};
-  try { body = JSON.parse(e.postData.contents); } catch (err) {}
-  return doGet({ parameter: body });
+// ชื่อยิ่งยาวยิ่งยอมให้ต่างได้มากขึ้น แต่ไม่เกิน 3 ตัว
+function distanceBudget(len) {
+  if (len <= 6) return 1;
+  if (len <= 12) return 2;
+  return 3;
 }
 
-function reply_(obj, callback) {
-  var json = JSON.stringify(obj);
-  if (callback) {
-    return ContentService.createTextOutput(callback + '(' + json + ');')
-      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+// สร้างตัวจับคู่จากรายชื่อสินค้าจริงในชีต Master
+function buildNameResolver(masterNames) {
+  const exact = new Set(masterNames);
+  const byNorm = new Map(); // ชื่อที่ล้างแล้ว -> ชื่อจริงในชีตที่ล้างแล้วได้ค่านี้
+  for (const real of masterNames) {
+    const key = normalizeName(real);
+    if (!key) continue;
+    if (!byNorm.has(key)) byNorm.set(key, []);
+    byNorm.get(key).push(real);
   }
-  return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
+  const entries = [...byNorm.entries()];
+  const cache = new Map();
+
+  return function resolveName(raw) {
+    const name = String(raw == null ? '' : raw).trim();
+    if (!name) return null;
+    if (cache.has(name)) return cache.get(name);
+
+    let result = null;
+    const key = normalizeName(name);
+
+    // ชั้น 1 ตรงกันเป๊ะทุกตัวอักษร
+    if (exact.has(name)) {
+      result = { name, how: 'ตรงเป๊ะ', exact: true };
+    }
+
+    // ชั้น 2 ตรงกันหลังตัดเว้นวรรคและวรรณยุกต์ออก
+    if (!result && key) {
+      const hit = byNorm.get(key);
+      if (hit && hit.length === 1) {
+        result = { name: hit[0], how: 'ต่างที่เว้นวรรค/วรรณยุกต์' };
+      }
+    }
+
+    // ชั้น 3 ชื่อหนึ่งเป็นส่วนหนึ่งของอีกชื่อ เช่นในชีตมียี่ห้อต่อท้าย
+    // ต้องเจอสินค้าเดียวเท่านั้น ถ้าเจอหลายตัวถือว่ากำกวม ไม่เดา
+    if (!result && key.length >= 4) {
+      const found = new Set();
+      for (const [k, names] of entries) {
+        if (k.includes(key) || key.includes(k)) names.forEach(n => found.add(n));
+      }
+      if (found.size === 1) {
+        result = { name: [...found][0], how: 'ชื่อย่อ/ชื่อเต็ม' };
+      }
+    }
+
+    // ชั้น 4 สะกดเพี้ยนเล็กน้อย ต้องมีผู้ชนะเดี่ยวที่ดีกว่าอันดับสองจริง ๆ
+    if (!result && key) {
+      const budget = distanceBudget(key.length);
+      let best = null, bestDist = Infinity, runnerUpDist = Infinity;
+      for (const [k, names] of entries) {
+        if (Math.abs(k.length - key.length) > budget) continue; // ตัดตัวที่ยาวต่างกันมากทิ้งก่อน
+        const d = editDistance(key, k);
+        if (d < bestDist) { runnerUpDist = bestDist; bestDist = d; best = names; }
+        else if (d < runnerUpDist) { runnerUpDist = d; }
+      }
+      if (best && best.length === 1 && bestDist <= budget && bestDist < runnerUpDist) {
+        result = { name: best[0], how: `สะกดต่างกัน ${bestDist} ตัว` };
+      }
+    }
+
+    cache.set(name, result);
+    return result;
+  };
+}
+// ดึงรายชื่อสินค้าทั้งหมดในชีต Master พร้อมยอดคงเหลือปัจจุบัน (ก่อนอัปเดต) และตำแหน่งแถว
+async function getMasterLookup() {
+  const sheets = getSheetsClient();
+  const { masterTitle } = await resolveSheetTitles();
+  const masterData = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${quoteSheetName(masterTitle)}!A:H`
+  });
+  const rows = masterData.data.values || [];
+  const nameToRow = {};   // ชื่อสินค้า -> เลขแถว (1-indexed ตรงกับ Google Sheet)
+  const nameToStock = {}; // ชื่อสินค้า -> ยอดคงเหลือปัจจุบัน (ค่าก่อนอัปเดตของวันนี้ = ค่าจากเมื่อวาน)
+  rows.forEach((row, idx) => {
+    if (idx === 0) return; // ข้ามหัวตาราง
+    const name = (row[1] || '').trim();
+    if (name) {
+      nameToRow[name] = idx + 1;
+      nameToStock[name] = row[6]; // คอลัมน์ G
+    }
+  });
+  // ตัวจับคู่ชื่อ สร้างครั้งเดียวต่อรอบ ใช้ร่วมกันทั้งตอนเช็คข้ามวันและตอนอัปเดตยอด
+  // เพื่อให้ทั้งสองที่ตัดสินใจเหมือนกันเสมอ
+  const resolve = buildNameResolver(Object.keys(nameToRow));
+  return { masterTitle, nameToRow, nameToStock, resolve };
 }
 
-/* =============================================================
- *  ทะเบียนสินค้า
- * ============================================================= */
+// เช็คว่า "ยกยอดมา" ที่เขียนวันนี้ ตรงกับ "คงเหลือ" ที่บันทึกไว้จากครั้งก่อน (เมื่อวาน) หรือไม่
+// ถ้าไม่มีข้อมูลเก่าเลย (สินค้าใหม่/ยังไม่เคยบันทึก) จะข้ามการเช็คนี้ไป
+function applyCrossDayCheck(item, lookup) {
+  const hit = lookup.resolve(item['สินค้า']);
+  const prevRaw = hit ? lookup.nameToStock[hit.name] : undefined;
+  if (prevRaw === undefined || prevRaw === null || prevRaw === '') {
+    return item; // ไม่มีข้อมูลเมื่อวานให้เทียบ ข้ามไป
+  }
+  const prev = Number(prevRaw);
+  const yok = Number(item['ยกยอดมา']) || 0;
+  if (isNaN(prev) || prev === yok) return item;
 
-function sheet_(name) {
-  var sh = SpreadsheetApp.getActive().getSheetByName(name);
-  if (!sh) throw new Error('ไม่พบชีต "' + name + '" — กรุณารัน setupSheets ก่อน');
-  return sh;
+  const note = `ยกยอดมาที่เขียน(${fmtNum(yok)}) ไม่ตรงกับคงเหลือครั้งก่อน(${fmtNum(prev)})`;
+  return {
+    ...item,
+    ผิดปกติ: true,
+    ข้ามวันไม่ตรง: true,
+    เหตุผล: item['เหตุผล'] ? item['เหตุผล'] + ' | ' + note : note
+  };
 }
 
-function num_(v) { return v === '' || v === null || v === undefined ? '' : Number(v); }
+// ลบแถวเก่าใน Movement Log ที่เป็นของ "วันนี้" และมี stk ตรงกับที่กำลังจะบันทึกใหม่
+// กันกรณีถ่ายรูปฟอร์มเดิมซ้ำในวันเดียวกัน ไม่ให้ประวัติซ้ำซ้อน (แทนที่ด้วยข้อมูลล่าสุดแทน)
+async function removeExistingTodayEntries(stkCodes) {
+  if (stkCodes.length === 0) return;
+  const sheets = getSheetsClient();
+  const { movementLogTitle } = await resolveSheetTitles();
 
-/** ปัดเศษทศนิยมลอย เช่น 4/0.4 = 9.999999999999998 -> 10 */
-function round_(n) { return Math.round(Number(n) * 1000) / 1000; }
+  // ต้องใช้ sheetId (ตัวเลข ไม่ใช่ชื่อ) สำหรับคำสั่งลบแถว
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID, fields: 'sheets.properties' });
+  const sheetProps = meta.data.sheets.find(s => s.properties.title === movementLogTitle)?.properties;
+  if (!sheetProps) return;
+  const sheetId = sheetProps.sheetId;
 
-function getProducts_() {
-  var sh = sheet_(SH_PRODUCTS);
-  if (sh.getLastRow() < 2) return [];
-  var v = sh.getRange(2, 1, sh.getLastRow() - 1, P_COLS).getValues();
-  var out = [];
-  for (var i = 0; i < v.length; i++) {
-    var code = String(v[i][0]).trim();
-    if (!code) continue;
-    out.push({
-      barcode:  code,
-      name:     String(v[i][1]),
-      unit:     String(v[i][2]),
-      min:      num_(v[i][3]),
-      par:      num_(v[i][4]),
-      pack:     num_(v[i][5]),
-      supplier: String(v[i][6] || ''),
-      ounit:    String(v[i][7] || '')
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${quoteSheetName(movementLogTitle)}!A:B` // A=วันที่เวลา, B=stk
+  });
+  const rows = res.data.values || [];
+  const todayStr = new Date().toLocaleDateString('th-TH', { timeZone: 'Asia/Bangkok' });
+
+  // หา index แถว (0-based ตรงกับตำแหน่งจริงในชีต เพราะ range เริ่มจาก A1 พอดี) ที่ต้องลบ
+  const rowIndicesToDelete = [];
+  rows.forEach((row, idx) => {
+    if (idx === 0) return; // ข้ามหัวตาราง
+    const dateCell = row[0] || '';
+    const stkCell = row[1] || '';
+    if (dateCell.startsWith(todayStr) && stkCodes.includes(stkCell)) {
+      rowIndicesToDelete.push(idx);
+    }
+  });
+  if (rowIndicesToDelete.length === 0) return;
+
+  // ลบจากแถวล่างขึ้นบน (index มากไปน้อย) กันปัญหาแถวเลื่อนตำแหน่งระหว่างลบ
+  rowIndicesToDelete.sort((a, b) => b - a);
+  const requests = rowIndicesToDelete.map(idx => ({
+    deleteDimension: {
+      range: { sheetId, dimension: 'ROWS', startIndex: idx, endIndex: idx + 1 }
+    }
+  }));
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: { requests }
+  });
+  console.log(`ลบแถวเก่าของวันนี้ที่ซ้ำ stk (${stkCodes.join(', ')}) ออก ${rowIndicesToDelete.length} แถว`);
+}
+
+async function appendMovementLog(items) {
+  const sheets = getSheetsClient();
+  const { movementLogTitle } = await resolveSheetTitles();
+  const now = new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' });
+  const rows = items.map(i => [
+    now, i['stk'] || '', i['หมวดหมู่'] || '', i['สินค้า'] || '', i['หน่วยนับ'] || '',
+    i['ยกยอดมา'], i['รับ'], i['เบิก'], i['คงเหลือ'], i['เหตุผล'] || ''
+  ]);
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${quoteSheetName(movementLogTitle)}!A:J`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: rows }
+  });
+}
+
+// อัปเดตคอลัมน์ "คงเหลือปัจจุบัน" (คอลัมน์ G) ในชีต Master ให้ตรงกับยอดล่าสุดของวันนี้
+// จับคู่ด้วยชื่อสินค้า (คอลัมน์ B) ถ้าหาไม่เจอในชีต Master จะข้ามและแจ้งใน log
+// รับ lookup ที่ fetch ไว้ล่วงหน้าแล้ว (จาก getMasterLookup) กันการดึงข้อมูลซ้ำซ้อน
+async function updateMasterCurrentStock(items, lookup) {
+  const sheets = getSheetsClient();
+  const { masterTitle, nameToRow, resolve } = lookup;
+
+  const updates = [];
+  const unmatched = [];
+  const fuzzy = []; // ที่จับคู่ได้แบบไม่ตรงเป๊ะ เก็บไว้แจ้งให้คนตรวจทาน
+  for (const item of items) {
+    const name = (item['สินค้า'] || '').trim();
+    const hit = resolve(name);
+    if (hit && nameToRow[hit.name]) {
+      if (!hit.exact) fuzzy.push({ from: name, to: hit.name, how: hit.how });
+      updates.push({
+        range: `${quoteSheetName(masterTitle)}!G${nameToRow[hit.name]}`,
+        values: [[item['คงเหลือ']]]
+      });
+    } else {
+      unmatched.push(name);
+    }
+  }
+
+  if (updates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { valueInputOption: 'USER_ENTERED', data: updates }
     });
   }
-  return out;
-}
-
-function lookupProduct_(barcode) {
-  if (!barcode) return null;
-  var list = getProducts_();
-  for (var i = 0; i < list.length; i++) if (list[i].barcode === barcode) return list[i];
-  return null;
-}
-
-/**
- * เพิ่ม/แก้ไขสินค้า — เขียนทับเฉพาะช่องที่ส่งมา (ช่องที่ไม่ส่งจะคงค่าเดิม)
- */
-function upsertProduct_(p) {
-  var barcode = String(p.barcode || '').trim();
-  if (!barcode) throw new Error('ไม่มีบาร์โค้ด');
-
-  var sh = sheet_(SH_PRODUCTS);
-  var last = sh.getLastRow();
-  var rowIdx = 0, cur = ['', '', '', '', '', '', '', ''];
-
-  if (last >= 2) {
-    var all = sh.getRange(2, 1, last - 1, P_COLS).getValues();
-    for (var i = 0; i < all.length; i++) {
-      if (String(all[i][0]).trim() === barcode) { rowIdx = i + 2; cur = all[i]; break; }
-    }
+  if (fuzzy.length > 0) {
+    console.log('🔗 จับคู่ชื่อแบบยืดหยุ่น ' + fuzzy.length + ' รายการ:');
+    fuzzy.forEach(f => console.log(`   "${f.from}" -> "${f.to}"  (${f.how})`));
   }
-
-  function pick(key, curVal, isNum) {
-    if (p[key] === undefined || p[key] === null) return curVal;
-    var s = String(p[key]).trim();
-    if (s === '') return isNum ? '' : (curVal === undefined ? '' : curVal);
-    return isNum ? Number(s) : s;
+  if (unmatched.length > 0) {
+    console.warn('⚠️ ไม่พบสินค้าเหล่านี้ในชีต Master (ไม่ได้อัปเดตยอด):', unmatched.join(', '));
   }
-
-  var name     = pick('name', String(cur[1] || '')) || barcode;
-  var unit     = pick('unit', String(cur[2] || '')) || 'ชิ้น';
-  var min      = pick('min',  num_(cur[3]), true);
-  var par      = pick('par',  num_(cur[4]), true);
-  var pack     = pick('pack', num_(cur[5]), true);
-  var supplier = pick('supplier', String(cur[6] || ''));
-  var ounit    = pick('ounit', String(cur[7] || ''));
-
-  var row = [name, unit, min, par, pack, supplier, ounit];
-  if (rowIdx) sh.getRange(rowIdx, 2, 1, 7).setValues([row]);
-  else        sh.appendRow([barcode].concat(row));
-
-  return { barcode: barcode, name: name, unit: unit, min: min, par: par,
-           pack: pack, supplier: supplier, ounit: ounit };
+  return { updatedCount: updates.length, unmatched, fuzzy };
 }
 
-/* =============================================================
- *  รายการเคลื่อนไหว
- * ============================================================= */
+// ดึงไฟล์รูปจริงจากเซิร์ฟเวอร์ LINE โดยใช้ messageId
+async function getLineImage(messageId) {
+  const res = await fetchWithTimeout(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
+    headers: { Authorization: `Bearer ${LINE_TOKEN}` }
+  }, 30000);
+  // ถ้าไม่เช็คตรงนี้ ข้อความ error จาก LINE จะถูกแปลงเป็น base64 แล้วส่งให้ AI อ่านแทนรูปจริง
+  if (!res.ok) {
+    throw new Error(`ดึงรูปจาก LINE ไม่สำเร็จ (${res.status}) messageId=${messageId}`);
+  }
+  const arrayBuffer = await res.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString('base64');
+  const mediaType = res.headers.get('content-type') || 'image/jpeg';
+  return { base64, mediaType };
+}
 
-function saveTransaction_(p) {
-  var barcode = String(p.barcode || '').trim();
-  if (!barcode) throw new Error('ไม่มีบาร์โค้ด');
+// ส่งรูปให้ Claude อ่านตัวหนังสือ แล้วแปลงเป็นข้อมูลสต็อก
+// รับได้หลายรูปพร้อมกัน (images = array ของ {base64, mediaType})
+async function readStockImages(images) {
+  const prompt = `นี่คือรูปฟอร์มบันทึกสต็อกสินค้า (แบบฟอร์ม STK) จำนวน ${images.length} รูป แต่ละรูปมีรหัสฟอร์มเขียนกำกับไว้มุมขวาบน (เช่น STK01, STK02, ... STK07) ให้อ่านรหัสนี้ของแต่ละรูปด้วย แล้วใส่กำกับไว้ในทุกแถวที่มาจากรูปนั้น ตารางมีหัวคอลัมน์เรียงจากซ้ายไปขวา แต่ให้อ่านเก็บข้อมูลเฉพาะ 4 คอลัมน์ตัวเลขนี้เท่านั้น:
+1. "ยกยอดมา" - ยอดที่ยกมาจากวันก่อน
+2. "+รับ" - จำนวนที่รับเข้าวันนี้
+3. "-เบิก" - จำนวนที่เบิกออกใช้วันนี้
+4. "คงเหลือ" - ยอดคงเหลือหลังหักเบิกแล้ว (คอลัมน์ขวาสุด)
+(ข้ามคอลัมน์ "รวมยอด" ไม่ต้องอ่าน)
 
-  var type = String(p.type || '').toUpperCase();
-  if (type !== 'IN' && type !== 'OUT') throw new Error('ประเภทต้องเป็น IN หรือ OUT');
+กติกาสำคัญ: ตารางนี้มีเส้นตีกรอบแบ่งแถวและคอลัมน์ชัดเจน ให้ไล่อ่านทีละแถวจากบนลงล่างอย่างเป็นระบบในแต่ละรูป ก่อนอ่านตัวเลขในแต่ละแถว ให้ระบุชื่อสินค้าของแถวนั้นก่อน แล้วค่อยลากสายตาไปทางขวาตามแนวเส้นตารางเดียวกันเพื่ออ่านตัวเลขแต่ละคอลัมน์ ห้ามข้ามไปอ่านตัวเลขจากแถวบนหรือแถวล่างเด็ดขาด นับจำนวนแถวทั้งหมดในแต่ละรูปก่อน แล้วให้แน่ใจว่าจำนวนรายการที่ตอบกลับตรงกับจำนวนแถวที่นับได้ อย่าเดาจากบริบทหรือความสมเหตุสมผลของตัวเลข
 
-  var qty = Number(p.qty || 0);
-  if (!(qty > 0)) throw new Error('จำนวนต้องมากกว่า 0');
+สำหรับคอลัมน์ "ยกยอดมา", "รับ", "คงเหลือ": ถ้าช่องว่างเปล่าไม่มีตัวเลขเขียนไว้ ให้ใส่ 0
+สำหรับคอลัมน์ "เบิก" เท่านั้น: ต้องแยกแยะให้ชัดระหว่างช่องที่ไม่มีลายมือเขียนอะไรเลย (ว่างจริง) กับช่องที่เขียนเลข 0 ไว้ ถ้าไม่มีลายมือเขียนอะไรในช่องเบิกเลย ให้ใส่ค่า null (ห้ามใส่ 0 แทน) ถ้ามีคนเขียนตัวเลขไว้จริง (รวมถึงเลข 0) ให้ใส่ตัวเลขนั้นตามที่เขียนจริง
 
-  var prod = lookupProduct_(barcode);
-  if (!prod) prod = upsertProduct_({ barcode: barcode, name: p.name, unit: p.unit });
+ตอบกลับเป็น JSON array เท่านั้น รวมทุกรูปไว้ใน array เดียว ไม่ต้องมีคำอธิบายอื่นใดๆ ทั้งสิ้น รูปแบบแต่ละแถว:
+{"stk": "รหัสฟอร์มเช่น STK04", "รูปที่": ลำดับรูป(เริ่มจาก1), "ลำดับ": ตัวเลขลำดับแถวในรูปนั้น, "หมวดหมู่": "...", "สินค้า": "...", "หน่วยนับ": "...", "ยกยอดมา": ตัวเลข, "รับ": ตัวเลข, "เบิก": ตัวเลขหรือnull, "คงเหลือ": ตัวเลข}`;
 
-  var ts = p.ts ? new Date(Number(p.ts)) : new Date();
-  sheet_(SH_TRANS).appendRow([
-    ts, barcode, prod.name, type, qty, prod.unit, String(p.user || ''), String(p.note || '')
-  ]);
+  const content = [];
+  images.forEach((img, idx) => {
+    content.push({ type: 'text', text: `รูปที่ ${idx + 1}:` });
+    content.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.base64 } });
+  });
+  content.push({ type: 'text', text: prompt });
+
+  const t0 = Date.now();
+  const res = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 32000,
+      messages: [{ role: 'user', content }]
+    })
+  }, 150000);
+  console.log(`[ai] อ่านรูปเสร็จใน ${Date.now() - t0}ms`);
+
+  const data = await res.json();
+  console.log('stop_reason:', data.stop_reason, '| usage:', JSON.stringify(data.usage));
+  console.log('Anthropic API raw response:', JSON.stringify(data).slice(0, 500));
+  if (!data.content) {
+    console.error('Anthropic API error:', JSON.stringify(data));
+    throw new Error('อ่านรูปไม่สำเร็จ');
+  }
+  if (data.stop_reason === 'max_tokens') {
+    console.warn('⚠️ คำตอบถูกตัดเพราะเกิน max_tokens คำตอบอาจไม่สมบูรณ์');
+  }
+  return data.content.map(b => b.text || '').join('');
+}
+
+// ตัดส่วนที่ไม่ใช่ JSON ออก เผื่อ Claude ห่อด้วย ```json ... ``` หรือมีข้อความอื่นปนมา
+function extractJsonArray(text) {
+  const cleaned = text.replace(/```json|```/g, '').trim();
+  const start = cleaned.indexOf('[');
+  const end = cleaned.lastIndexOf(']');
+  if (start === -1 || end === -1) throw new Error('ไม่พบ JSON array ในคำตอบ');
+  return JSON.parse(cleaned.slice(start, end + 1));
+}
+
+// แสดงตัวเลข: ถ้าเป็นจำนวนเต็มคงเดิม ถ้ามีทศนิยมให้ปัดเหลือ 2 ตำแหน่ง
+function fmtNum(n) {
+  const num = Number(n);
+  if (isNaN(num)) return n;
+  return Number.isInteger(num) ? String(num) : num.toFixed(2);
+}
+
+// เช็คและปรับปรุงค่า "เบิก" จาก 3 ค่าที่ยึดตามกระดาษ (ห้ามแก้): ยกยอดมา, รับ, คงเหลือ
+// สูตร: ยกยอดมา + รับ - เบิก = คงเหลือ  =>  เบิกที่ถูกต้อง = ยกยอดมา + รับ - คงเหลือ
+function reconcileItem(item) {
+  const yok = Number(item['ยกยอดมา']) || 0;
+  const rap = Number(item['รับ']) || 0;
+  const kong = Number(item['คงเหลือ']) || 0;
+  const correctBik = yok + rap - kong;
+
+  const writtenBik = item['เบิก']; // null = ช่องว่างจริง, ตัวเลข = มีคนเขียนไว้
+  const wasBlank = writtenBik === null || writtenBik === undefined;
+  const mismatch = !wasBlank && Number(writtenBik) !== correctBik;
+
+  let เหตุผล = '';
+  if (wasBlank) {
+    เหตุผล = `ช่องเบิกว่าง คำนวณให้จาก ${fmtNum(yok)}+${fmtNum(rap)}-${fmtNum(kong)} = ${fmtNum(correctBik)}`;
+  } else if (mismatch) {
+    เหตุผล = `เบิกเดิมเขียน ${fmtNum(writtenBik)} แต่คำนวณจาก ${fmtNum(yok)}+${fmtNum(rap)}-${fmtNum(kong)} ได้ ${fmtNum(correctBik)} (แก้ไขแล้ว)`;
+  }
 
   return {
-    barcode: barcode, name: prod.name, unit: prod.unit,
-    type: type, qty: qty, balance: balanceOf_(barcode),
-    time: Utilities.formatDate(ts, TZ, 'dd/MM/yyyy HH:mm')
+    ...item,
+    เบิก: wasBlank || mismatch ? correctBik : Number(writtenBik),
+    ผิดปกติ: mismatch,      // สีแดง: มีคนเขียนไว้แต่ผิด ต้องแก้
+    autoFilled: wasBlank,   // ช่องว่าง ไม่ถือว่าผิด แค่กรอกให้
+    เหตุผล
   };
 }
 
-function saveBatch_(itemsJson) {
-  var items = [];
-  try { items = JSON.parse(itemsJson || '[]'); } catch (e) { throw new Error('ข้อมูล batch ไม่ถูกต้อง'); }
-  var results = [];
-  for (var i = 0; i < items.length; i++) results.push(saveTransaction_(items[i]));
-  return results;
-}
+// สร้าง Flex Carousel: 1 ข้อความ มีหลายการ์ดเลื่อนดู
+// 1 รูปที่ส่งเข้ามา = 1 การ์ดเป๊ะๆ (เรียงตามลำดับรูปที่ส่ง) + การ์ดสุดท้ายคือสรุปสั่งซื้อ
+function buildValidationFlex(items, saveResult = {}, summaryRows = []) {
+  // เรียงตามลำดับรูปที่ส่งเข้ามา (รูปที่ 1, 2, 3, ...) แล้วตามด้วยลำดับแถวเดิมในรูปนั้น
+  const sorted = [...items].sort((a, b) => {
+    const diff = (Number(a['รูปที่']) || 0) - (Number(b['รูปที่']) || 0);
+    if (diff !== 0) return diff;
+    return (Number(a['ลำดับ']) || 0) - (Number(b['ลำดับ']) || 0);
+  });
 
-function balanceOf_(barcode) {
-  var sh = sheet_(SH_TRANS);
-  if (sh.getLastRow() < 2) return 0;
-  var v = sh.getRange(2, 2, sh.getLastRow() - 1, 4).getValues();
-  var bal = 0;
-  for (var i = 0; i < v.length; i++) {
-    if (String(v[i][0]).trim() !== barcode) continue;
-    bal += (String(v[i][2]).toUpperCase() === 'IN' ? 1 : -1) * Number(v[i][3] || 0);
+  // จัดกลุ่มตาม "รูปที่" — 1 กลุ่ม = 1 รูป = 1 การ์ด (ไม่รวมกันแม้ stk จะซ้ำกันก็ตาม)
+  const groups = [];
+  let current = null;
+  for (const item of sorted) {
+    const imgNum = item['รูปที่'];
+    if (!current || current.imgNum !== imgNum) {
+      current = { imgNum, stk: item['stk'], items: [] };
+      groups.push(current);
+    }
+    current.items.push(item);
   }
-  return bal;
-}
 
-/* =============================================================
- *  ยอดคงเหลือ + รายการที่ต้องสั่ง
- * ============================================================= */
-
-function balanceMap_() {
-  var trans = sheet_(SH_TRANS);
-  var map = {};
-  if (trans.getLastRow() < 2) return map;
-  var v = trans.getRange(2, 2, trans.getLastRow() - 1, 4).getValues();
-  for (var i = 0; i < v.length; i++) {
-    var code = String(v[i][0]).trim();
-    if (!code) continue;
-    if (!map[code]) map[code] = { inQty: 0, outQty: 0 };
-    var q = Number(v[i][3] || 0);
-    if (String(v[i][2]).toUpperCase() === 'IN') map[code].inQty += q; else map[code].outQty += q;
-  }
-  return map;
-}
-
-function getSummary_() {
-  var map = balanceMap_();
-  var products = getProducts_();
-  var rows = [];
-  for (var j = 0; j < products.length; j++) {
-    var pr = products[j];
-    var m = map[pr.barcode] || { inQty: 0, outQty: 0 };
-    var bal = m.inQty - m.outQty;
-    rows.push({
-      barcode: pr.barcode, name: pr.name, unit: pr.unit,
-      inQty: m.inQty, outQty: m.outQty, balance: bal,
-      min: pr.min, par: pr.par, pack: pr.pack, supplier: pr.supplier, ounit: pr.ounit,
-      low: pr.min !== '' && bal <= Number(pr.min)
+  // สร้างการ์ด (บับเบิล) 1 ใบต่อ 1 STK
+  const stkBubbles = groups.map(group => {
+    const itemBoxes = group.items.map(item => {
+      const label = item['ผิดปกติ']
+        ? `${item['ข้ามวันไม่ตรง'] ? '🔁' : '⚠️'} ${item['ลำดับ']}. ${item['สินค้า']}`
+        : `${item['ลำดับ']}. ${item['สินค้า']}`;
+      const detail = `ยกมา:${fmtNum(item['ยกยอดมา'])}  รับ:${fmtNum(item['รับ'])}  เบิก:${fmtNum(item['เบิก'])}  คงเหลือ:${fmtNum(item['คงเหลือ'])}`;
+      const contents = [
+        { type: 'text', text: label, wrap: true, size: 'sm', weight: 'bold', color: item['ผิดปกติ'] ? '#FF0000' : '#111111' },
+        { type: 'text', text: detail, wrap: true, size: 'xs', color: item['ผิดปกติ'] ? '#FF0000' : '#666666' }
+      ];
+      if (item['ผิดปกติ']) {
+        contents.push({ type: 'text', text: '⚠️ ' + item['เหตุผล'], wrap: true, size: 'xxs', color: '#FF0000' });
+      } else if (item['autoFilled']) {
+        contents.push({ type: 'text', text: '📝 ' + item['เหตุผล'], wrap: true, size: 'xxs', color: '#1E7FD9' });
+      }
+      return { type: 'box', layout: 'vertical', margin: 'md', contents };
     });
-  }
-  rows.sort(function (a, b) { return a.name < b.name ? -1 : 1; });
-  return rows;
-}
+    const problemInGroup = group.items.filter(i => i['ผิดปกติ']).length;
+    return {
+      type: 'bubble',
+      size: 'giga',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          { type: 'text', text: `📋 รูปที่ ${group.imgNum ?? '-'}: ${group.stk || 'ไม่ทราบฟอร์ม'}`, weight: 'bold', size: 'lg' },
+          { type: 'text', text: `${group.items.length} รายการ` + (problemInGroup > 0 ? ` | พบ ${problemInGroup} รายการยอดผิด` : ''), size: 'xs', color: '#888888' },
+          { type: 'separator', margin: 'md' },
+          ...itemBoxes
+        ]
+      }
+    };
+  });
 
-/**
- * คำนวณจำนวนที่ต้องสั่ง แล้วจัดกลุ่มตามซัพพลายเออร์
- *   เงื่อนไขสั่ง : คงเหลือ <= ขั้นต่ำ
- *   จำนวนที่สั่ง : (สั่งเติมถึง − คงเหลือ) ปัดขึ้นเป็นจำนวนเต็มลัง
- *   ถ้าไม่ได้ตั้ง "สั่งเติมถึง" ระบบใช้ ขั้นต่ำ × 2
- */
-function getReorder_() {
-  var rows = getSummary_();
-  var bySup = {};
-
-  for (var i = 0; i < rows.length; i++) {
-    var r = rows[i];
-    if (r.min === '' ) continue;                 // ไม่ได้ตั้งขั้นต่ำ = ไม่คุมสต็อก
-    if (r.balance > Number(r.min)) continue;     // ยังไม่ถึงจุดสั่ง
-
-    var par  = r.par === '' ? Number(r.min) * 2 : Number(r.par);
-    // ขนาดบรรจุรับทศนิยมได้ เช่น 2.5 (1 ก้อน = 2.5 กก.) หรือ 0.4 (1 กก. = 0.4 ก้อน)
-    var pack = (r.pack === '' || !(Number(r.pack) > 0)) ? 1 : Number(r.pack);
-    var need = par - r.balance;
-    if (need <= 0) need = pack;                  // ถึงจุดสั่งแล้วอย่างน้อยต้องสั่ง 1 หน่วยสั่งซื้อ
-    var qty = round_(Math.ceil(round_(need / pack)) * pack);
-
-    // แปลงเป็นหน่วยสั่งซื้อ เช่น นับเป็น กก. แต่สั่งเป็น ก้อน (ก้อนละ 2.5 กก.)
-    var ounit    = r.ounit || (pack !== 1 ? 'หน่วยสั่ง' : r.unit);
-    var orderQty = round_(qty / pack);
-
-    var sup = r.supplier || 'ไม่ระบุซัพพลายเออร์';
-    if (!bySup[sup]) bySup[sup] = [];
-    bySup[sup].push({
-      barcode: r.barcode, name: r.name, unit: r.unit,
-      balance: r.balance, min: r.min, par: par, pack: pack,
-      qty: qty,               // จำนวนในหน่วยนับ (เช่น 36 ชิ้น)
-      orderQty: orderQty,     // จำนวนในหน่วยสั่งซื้อ (เช่น 3 ลัง)
-      ounit: ounit
-    });
-  }
-
-  var groups = [];
-  for (var sup2 in bySup) {
-    bySup[sup2].sort(function (a, b) { return a.name < b.name ? -1 : 1; });
-    groups.push({ supplier: sup2, items: bySup[sup2], count: bySup[sup2].length });
-  }
-  groups.sort(function (a, b) { return a.supplier < b.supplier ? -1 : 1; });
-  return groups;
-}
-
-function getRecent_(limit) {
-  var sh = sheet_(SH_TRANS);
-  var last = sh.getLastRow();
-  if (last < 2) return [];
-  var n = Math.min(limit, last - 1);
-  var v = sh.getRange(last - n + 1, 1, n, 8).getValues();
-  var out = [];
-  for (var i = v.length - 1; i >= 0; i--) {
-    out.push({
-      time: v[i][0] instanceof Date ? Utilities.formatDate(v[i][0], TZ, 'dd/MM HH:mm') : String(v[i][0]),
-      barcode: String(v[i][1]), name: String(v[i][2]), type: String(v[i][3]),
-      qty: Number(v[i][4] || 0), unit: String(v[i][5]), user: String(v[i][6])
-    });
-  }
-  return out;
-}
-
-/* =============================================================
- *  ติดตั้ง / อัปเกรดชีต
- * ============================================================= */
-
-var P_HEADERS = ['บาร์โค้ด', 'ชื่อสินค้า', 'หน่วยนับ', 'จำนวนขั้นต่ำ', 'สั่งเติมถึง',
-                 'ขนาดบรรจุ', 'ซัพพลายเออร์', 'หน่วยสั่งซื้อ'];
-var T_HEADERS = ['วันเวลา', 'บาร์โค้ด', 'ชื่อสินค้า', 'ประเภท', 'จำนวน', 'หน่วย', 'ผู้ทำรายการ', 'หมายเหตุ'];
-var S_HEADERS = ['บาร์โค้ด', 'ชื่อสินค้า', 'หน่วยนับ', 'รับเข้า', 'เบิกออก', 'คงเหลือ',
-                 'ขั้นต่ำ', 'สั่งเติมถึง', 'ขนาดบรรจุ', 'ซัพพลายเออร์',
-                 'ต้องสั่ง', 'หน่วยสั่ง', 'คิดเป็นหน่วยนับ', 'สถานะ'];
-
-/** ติดตั้งใหม่ทั้งหมด (ล้างข้อมูลเดิม) */
-function setupSheets() {
-  var ss = SpreadsheetApp.getActive();
-  ss.setSpreadsheetTimeZone(TZ);
-
-  var p = ss.getSheetByName(SH_PRODUCTS) || ss.insertSheet(SH_PRODUCTS);
-  p.clear();
-  var t = ss.getSheetByName(SH_TRANS) || ss.insertSheet(SH_TRANS);
-  t.clear();
-
-  applyProductsFormat_(p);
-  applyTransFormat_(t);
-  buildStock_(ss);
-
-  // ใช้ toast แทน alert — alert จะไปเด้งที่หน้า Sheet แล้วสคริปต์จะค้างรอจนหมดเวลา
-  say_(ss, 'ติดตั้งเรียบร้อย — สร้างชีต Products / Transactions / Stock แล้ว');
-}
-
-/** แจ้งผลแบบไม่บล็อกการทำงาน */
-function say_(ss, msg) {
-  Logger.log(msg);
-  try { ss.toast(msg, '📦 ระบบสต็อก', 12); } catch (e) {}
-}
-
-/** อัปเกรดจากเวอร์ชันเดิมโดยไม่ลบข้อมูล */
-function upgradeSheets() {
-  var ss = SpreadsheetApp.getActive();
-  ss.setSpreadsheetTimeZone(TZ);
-
-  // ลบชีต Stock ทิ้งก่อนเป็นอย่างแรก — สูตรเวอร์ชันเก่ากินเวลาคำนวณมหาศาล
-  // ถ้าปล่อยไว้ ทุกคำสั่งหลังจากนี้จะรอการคำนวณจนสคริปต์หมดเวลา
-  dropStock();
-
-  var p = ss.getSheetByName(SH_PRODUCTS);
-  if (!p) { setupSheets(); return; }
-  applyProductsFormat_(p);
-
-  var t = ss.getSheetByName(SH_TRANS) || ss.insertSheet(SH_TRANS);
-  if (t.getLastRow() === 0) applyTransFormat_(t);
-  else t.getRange(1, 1, 1, T_HEADERS.length).setValues([T_HEADERS])
-        .setFontWeight('bold').setBackground('#188038').setFontColor('#ffffff');
-
-  buildStock_(ss);
-
-  say_(ss, 'อัปเกรดเรียบร้อย — ข้อมูลเดิมอยู่ครบ · เพิ่มคอลัมน์ "หน่วยสั่งซื้อ" ในชีต Products · ขั้นต่อไป: Deploy เวอร์ชันใหม่');
-}
-
-/* =============================================================
- *  เครื่องมือกรอกสินค้าทีละหลายรายการ
- * ============================================================= */
-
-var CODE_PREFIX = 'SKU';   // รูปแบบรหัสที่สร้างให้ เช่น SKU0001
-
-/**
- * สร้างรหัสสินค้าให้แถวที่มีชื่อสินค้าแต่ยังไม่มีรหัส
- * ใช้หลังจากวางรายการสินค้าใหม่ลงชีต Products แล้วเว้นคอลัมน์ A ว่างไว้
- */
-function generateCodes() {
-  var ss = SpreadsheetApp.getActive();
-  var sh = sheet_(SH_PRODUCTS);
-  var last = sh.getLastRow();
-  if (last < 2) { say_(ss, 'ยังไม่มีรายการสินค้าในชีต Products'); return; }
-
-  var rng = sh.getRange(2, 1, last - 1, 2);
-  var v = rng.getValues();
-
-  var used = {}, maxN = 0;
-  var re = new RegExp('^' + CODE_PREFIX + '(\\d+)$');
-  for (var i = 0; i < v.length; i++) {
-    var c = String(v[i][0]).trim();
-    if (!c) continue;
-    used[c] = true;
-    var m = c.match(re);
-    if (m) maxN = Math.max(maxN, Number(m[1]));
-  }
-
-  var made = 0;
-  for (var j = 0; j < v.length; j++) {
-    if (String(v[j][0]).trim()) continue;         // มีรหัสอยู่แล้ว
-    if (!String(v[j][1]).trim()) continue;        // ไม่มีชื่อสินค้า = แถวว่าง
-    var code;
-    do {
-      maxN++;
-      code = CODE_PREFIX + ('0000' + maxN).slice(-4);
-    } while (used[code]);
-    used[code] = true;
-    v[j][0] = code;
-    made++;
-  }
-
-  if (made) {
-    sh.getRange('A:A').setNumberFormat('@');
-    rng.setValues(v);
-  }
-  say_(ss, made ? '✓ สร้างรหัสให้ ' + made + ' รายการแล้ว — ขั้นต่อไปไปพิมพ์สติกเกอร์ QR'
-                : 'ทุกรายการมีรหัสอยู่แล้ว ไม่มีอะไรต้องสร้าง');
-}
-
-/** ตรวจหารหัสสินค้าซ้ำ — รหัสซ้ำจะทำให้สแกนแล้วได้สินค้าผิดตัว */
-function checkDuplicates() {
-  var ss = SpreadsheetApp.getActive();
-  var sh = sheet_(SH_PRODUCTS);
-  if (sh.getLastRow() < 2) { say_(ss, 'ยังไม่มีรายการสินค้า'); return; }
-
-  var v = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
-  var seen = {}, dup = [];
-  for (var i = 0; i < v.length; i++) {
-    var c = String(v[i][0]).trim();
-    if (!c) continue;
-    if (seen[c]) dup.push(c + ' (แถว ' + seen[c] + ' และ ' + (i + 2) + ')');
-    else seen[c] = i + 2;
-  }
-  var msg = dup.length ? '⚠️ พบรหัสซ้ำ ' + dup.length + ' รายการ: ' + dup.slice(0, 5).join(' · ')
-                       : '✓ ไม่มีรหัสซ้ำ';
-  Logger.log(dup.join('\n'));
-  say_(ss, msg);
-}
-
-/** ลบชีต Stock ทิ้ง (ใช้แก้อาการสคริปต์ค้าง / Exceeded maximum execution time) */
-function dropStock() {
-  var ss = SpreadsheetApp.getActive();
-  var s = ss.getSheetByName(SH_STOCK);
-  if (!s) return;
-  if (ss.getSheets().length < 2) ss.insertSheet('temp');
-  ss.deleteSheet(s);
-  SpreadsheetApp.flush();
-}
-
-function applyProductsFormat_(p) {
-  p.getRange(1, 1, 1, P_HEADERS.length).setValues([P_HEADERS])
-    .setFontWeight('bold').setBackground('#1a73e8').setFontColor('#ffffff');
-  p.setFrozenRows(1);
-  p.getRange('A:A').setNumberFormat('@');
-  p.setColumnWidth(1, 160); p.setColumnWidth(2, 260); p.setColumnWidth(3, 80);
-  p.setColumnWidth(4, 110); p.setColumnWidth(5, 110); p.setColumnWidth(6, 110);
-  p.setColumnWidth(7, 170); p.setColumnWidth(8, 120);
-
-  var notes = [[
-    'รหัสบนสติกเกอร์ (บาร์โค้ดหรือ QR)',
-    'ชื่อที่จะขึ้นตอนสแกน',
-    'หน่วยที่ใช้นับสต็อกและสแกน เช่น ชิ้น ขวด แผ่น',
-    'ต่ำกว่าหรือเท่านี้ = ถึงจุดสั่งซื้อ (นับเป็นหน่วยนับ)',
-    'สั่งให้เต็มถึงระดับนี้ (นับเป็นหน่วยนับ · เว้นว่าง = ใช้ขั้นต่ำ × 2)',
-    '1 หน่วยสั่งซื้อ = กี่หน่วยนับ · ใส่ทศนิยมได้ เช่น 12 (ลังละ 12 ชิ้น) หรือ 2.5 (ก้อนละ 2.5 กก.) · เว้นว่าง = สั่งเป็นหน่วยนับ',
-    'ชื่อร้าน/ซัพพลายเออร์ — ใช้แยกใบสั่งซื้อ',
-    'หน่วยที่ใช้สั่งกับซัพ เช่น ลัง โหล ก้อน (ใช้คู่กับขนาดบรรจุ)'
-  ]];
-  p.getRange(1, 1, 1, P_HEADERS.length).setNotes(notes);
-}
-
-function applyTransFormat_(t) {
-  t.getRange(1, 1, 1, T_HEADERS.length).setValues([T_HEADERS])
-    .setFontWeight('bold').setBackground('#188038').setFontColor('#ffffff');
-  t.setFrozenRows(1);
-  t.getRange('A:A').setNumberFormat('dd/mm/yyyy hh:mm:ss');
-  t.getRange('B:B').setNumberFormat('@');
-  t.setColumnWidth(1, 150); t.setColumnWidth(2, 160); t.setColumnWidth(3, 260);
-
-  t.setConditionalFormatRules([
-    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('IN')
-      .setBackground('#e6f4ea').setFontColor('#137333')
-      .setRanges([t.getRange('D2:D')]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('OUT')
-      .setBackground('#fce8e6').setFontColor('#c5221f')
-      .setRanges([t.getRange('D2:D')]).build()
-  ]);
-}
-
-/* ขอบเขตสูตร — จำกัดจำนวนแถวเพื่อไม่ให้ Google Sheet คำนวณช้าจนสคริปต์หมดเวลา
- * MAX_P = จำนวนสินค้าสูงสุด, MAX_T = จำนวนรายการเคลื่อนไหวสูงสุด
- * ถ้าข้อมูลใกล้เต็ม ให้เพิ่มตัวเลขแล้วรัน upgradeSheets ใหม่ */
-var MAX_P = 2000;
-var MAX_T = 100000;
-
-function buildStock_(ss) {
-  // ลบชีตเดิมทิ้งก่อน เพื่อไม่ให้สูตรหนักของเวอร์ชันเก่าถูกคำนวณซ้ำระหว่างอัปเกรด
-  var old = ss.getSheetByName(SH_STOCK);
-  if (old) ss.deleteSheet(old);
-  var s = ss.insertSheet(SH_STOCK);
-
-  s.getRange(1, 1, 1, S_HEADERS.length).setValues([S_HEADERS])
-    .setFontWeight('bold').setBackground('#e37400').setFontColor('#ffffff');
-  s.setFrozenRows(1);
-
-  var P = SH_PRODUCTS, T = SH_TRANS;
-  var A = 'A2:A' + MAX_P;
-  var PR = P + '!A2:H' + MAX_P;
-
-  var lk = function (col) {
-    return '=ARRAYFORMULA(IF(' + A + '="","",IFERROR(VLOOKUP(' + A + ',' + PR + ',' + col + ',FALSE),"")))';
-  };
-  var C = 'C2:C' + MAX_P;
-
-  // รวมยอดด้วย QUERY ครั้งเดียว แล้วค่อย VLOOKUP — เร็วกว่า SUMIFS รายแถวมาก
-  var sumBy = function (type) {
-    return 'QUERY(' + T + '!B2:E' + MAX_T +
-           ',"select Col1, sum(Col4) where Col3=\'' + type + '\' group by Col1 label sum(Col4) \'\'",0)';
-  };
-  var totals = function (type) {
-    return '=ARRAYFORMULA(IF(' + A + '="","",IFERROR(VLOOKUP(' + A + ',' + sumBy(type) + ',2,FALSE),0)))';
+  // การ์ดสุดท้าย: สรุปสั่งซื้อ แยกตามซัพพลายเออร์
+  const orderGroups = {};
+  summaryRows.forEach(row => {
+    const supplier = row[0] || 'ไม่ระบุซัพพลายเออร์';
+    if (!orderGroups[supplier]) orderGroups[supplier] = [];
+    orderGroups[supplier].push(row);
+  });
+  const orderSections = Object.entries(orderGroups).flatMap(([supplier, orderItems], idx) => {
+    const header = {
+      type: 'box',
+      layout: 'vertical',
+      margin: idx === 0 ? 'none' : 'lg',
+      contents: [
+        { type: 'text', text: `🏷️ ${supplier}`, weight: 'bold', size: 'sm', color: '#1E7FD9', wrap: true },
+        { type: 'separator', margin: 'xs' }
+      ]
+    };
+    const itemBoxes = orderItems.map(row => ({
+      type: 'box',
+      layout: 'vertical',
+      margin: 'md',
+      contents: [
+        { type: 'text', text: row[1] || '', wrap: true, size: 'sm', weight: 'bold' },
+        { type: 'text', text: `คงเหลือ ${row[3]} ${row[2] || ''}  (ต่ำกว่าขั้นต่ำ ${row[4]})`, size: 'xs', color: '#666666', wrap: true },
+        { type: 'text', text: `สั่งเพิ่ม ${row[6]} ${row[5] || ''}`, size: 'sm', weight: 'bold', color: '#FF0000' }
+      ]
+    }));
+    return [header, ...itemBoxes];
+  });
+  const orderBubble = {
+    type: 'bubble',
+    size: 'giga',
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      spacing: 'sm',
+      contents: [
+        { type: 'text', text: '📦 สรุปสั่งซื้อ', weight: 'bold', size: 'lg' },
+        {
+          type: 'text',
+          text: summaryRows.length > 0 ? `${summaryRows.length} รายการ จาก ${Object.keys(orderGroups).length} ซัพพลายเออร์` : 'สต็อกเพียงพอ ไม่ต้องสั่งเพิ่ม 👍',
+          size: 'xs',
+          color: '#888888'
+        },
+        { type: 'separator', margin: 'md' },
+        ...orderSections
+      ]
+    }
   };
 
-  s.getRange('A2').setFormula('=IFERROR(FILTER(' + P + '!A2:A' + MAX_P + ',' + P + '!A2:A' + MAX_P + '<>""),"")');
-  s.getRange('B2').setFormula(lk(2));
-  s.getRange('C2').setFormula(lk(3));
-  s.getRange('D2').setFormula(totals('IN'));
-  s.getRange('E2').setFormula(totals('OUT'));
-  s.getRange('F2').setFormula('=ARRAYFORMULA(IF(' + A + '="","",D2:D' + MAX_P + '-E2:E' + MAX_P + '))');
-  s.getRange('G2').setFormula(lk(4));   // ขั้นต่ำ
-  s.getRange('H2').setFormula(lk(5));   // สั่งเติมถึง
-  s.getRange('I2').setFormula(lk(6));   // ขนาดบรรจุ
-  s.getRange('J2').setFormula(lk(7));   // ซัพพลายเออร์
+  const problemCount = items.filter(i => i['ผิดปกติ']).length;
+  const filledCount = items.filter(i => i['autoFilled']).length;
+  const parts = [`อ่านได้ ${items.length} รายการ จาก ${groups.length} รูป`];
+  if (problemCount > 0) parts.push(`พบ ${problemCount} รายการยอดผิด (แก้ไขให้แล้ว)`);
+  if (filledCount > 0) parts.push(`กรอกช่องเบิกที่ว่างให้ ${filledCount} รายการ`);
+  if (saveResult.updatedCount !== undefined) parts.push(`บันทึกลง Sheet แล้ว ${saveResult.updatedCount} รายการ`);
+  if (summaryRows.length > 0) parts.push(`ต้องสั่งเพิ่ม ${summaryRows.length} รายการ`);
+  const altText = parts.join(' | ');
 
-  var G = 'G2:G' + MAX_P, H = 'H2:H' + MAX_P, I = 'I2:I' + MAX_P, F = 'F2:F' + MAX_P;
-  var par  = 'IF(' + H + '="",' + G + '*2,' + H + ')';
-  // ขนาดบรรจุรับทศนิยม เช่น 2.5 หรือ 0.4
-  var pack = 'IF(N(' + I + ')>0,' + I + ',1)';
-  // จำนวนที่ต้องสั่ง คิดเป็นหน่วยนับ แล้วปัดขึ้นเป็นจำนวนเต็มหน่วยสั่งซื้อ
-  var qtyStock =
-    'IF(' + F + '>' + G + ',0,' +
-      'ROUND(CEILING(ROUND(IF(' + par + '-' + F + '<=0,' + pack + ',' + par + '-' + F + ')/' +
-        pack + ',6))*' + pack + ',3))';
-  var ou = 'IFERROR(VLOOKUP(' + A + ',' + PR + ',8,FALSE),"")';
-
-  // K = ต้องสั่ง (หน่วยสั่งซื้อ)
-  s.getRange('K2').setFormula(
-    '=ARRAYFORMULA(IF(' + A + '="","",IF(' + G + '="","",ROUND((' + qtyStock + ')/' + pack + ',3))))');
-
-  // L = ชื่อหน่วยสั่งซื้อ
-  s.getRange('L2').setFormula(
-    '=ARRAYFORMULA(IF(' + A + '="","",IF(' + ou + '<>"",' + ou + ',' + C + ')))');
-
-  // M = คิดเป็นหน่วยนับ
-  s.getRange('M2').setFormula(
-    '=ARRAYFORMULA(IF(' + A + '="","",IF(' + G + '="","",' + qtyStock + ')))');
-
-  s.getRange('N2').setFormula(
-    '=ARRAYFORMULA(IF(' + A + '="","",IF(' + G + '="","",IF(' + F + '<=' + G + ',"⚠️ ต้องสั่งเพิ่ม","ปกติ"))))');
-
-  s.getRange('A:A').setNumberFormat('@');
-  s.setColumnWidth(1, 150); s.setColumnWidth(2, 240); s.setColumnWidth(10, 170);
-  s.setColumnWidth(13, 130); s.setColumnWidth(14, 150);
-
-  s.setConditionalFormatRules([
-    SpreadsheetApp.newConditionalFormatRule().whenTextContains('ต้องสั่ง')
-      .setBackground('#fce8e6').setFontColor('#c5221f')
-      .setRanges([s.getRange(2, 1, MAX_P - 1, S_HEADERS.length)]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(0)
-      .setBackground('#fff4e5').setFontColor('#b45309').setBold(true)
-      .setRanges([s.getRange(2, 11, MAX_P - 1, 1)]).build()
-  ]);
+  return {
+    type: 'flex',
+    altText,
+    contents: { type: 'carousel', contents: [...stkBubbles, orderBubble] }
+  };
 }
 
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('📦 ระบบสต็อก')
-    .addItem('🔢 สร้างรหัสสินค้าอัตโนมัติ', 'generateCodes')
-    .addItem('🔍 ตรวจหารหัสซ้ำ', 'checkDuplicates')
-    .addSeparator()
-    .addItem('อัปเกรดชีต (ไม่ลบข้อมูล)', 'upgradeSheets')
-    .addItem('ลบชีต Stock (แก้อาการค้าง)', 'dropStock')
-    .addSeparator()
-    .addItem('ติดตั้งใหม่ทั้งหมด (ล้างข้อมูล)', 'setupSheets')
-    .addToUi();
+// ส่งข้อความกลับไปใน LINE รองรับทั้งข้อความธรรมดาและ Flex Message
+async function replyToLine(replyToken, message) {
+  let messages;
+  if (typeof message === 'string') messages = [{ type: 'text', text: message }];
+  else if (Array.isArray(message)) messages = message;
+  else messages = [message];
+  const lineRes = await fetchWithTimeout('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${LINE_TOKEN}`
+    },
+    body: JSON.stringify({ replyToken, messages })
+  }, 30000);
+  if (!lineRes.ok) {
+    console.error('LINE reply error:', lineRes.status, await lineRes.text());
+    return false;
+  }
+  return true;
 }
+
+// LINE ให้ใช้ replyToken ได้ครั้งเดียวและมีอายุราว 1 นาทีนับจากที่ webhook เข้ามา
+// งานอ่านรูป + บันทึก Sheet มักใช้เวลานานกว่านั้น พอ reply ไม่ผ่านผู้ใช้จะไม่ได้อะไรกลับเลย
+// ฟังก์ชันนี้จึงเปลี่ยนไปส่งแบบ push ให้อัตโนมัติ เพื่อให้ข้อความถึงมือผู้ใช้เสมอ
+const REPLY_TOKEN_BUDGET_MS = 55000;
+
+function replyTarget(event) {
+  const src = (event && event.source) || {};
+  return src.groupId || src.roomId || src.userId || LINE_PUSH_TARGET;
+}
+
+async function deliverToLine(replyToken, target, message, startedAt) {
+  const elapsed = Date.now() - startedAt;
+
+  if (elapsed < REPLY_TOKEN_BUDGET_MS) {
+    if (await replyToLine(replyToken, message)) {
+      console.log(`[ส่งกลับ] reply สำเร็จ ใช้เวลารวม ${elapsed}ms`);
+      return;
+    }
+    console.warn(`[ส่งกลับ] reply ไม่ผ่านที่ ${elapsed}ms เปลี่ยนไปใช้ push`);
+  } else {
+    console.warn(`[ส่งกลับ] ใช้เวลา ${elapsed}ms เกินอายุ replyToken ข้ามไปใช้ push เลย`);
+  }
+
+  if (!target) {
+    console.error('[ส่งกลับ] ไม่รู้ปลายทาง ส่ง push ไม่ได้ ข้อความหายไป');
+    return;
+  }
+  await pushToLine(target, message);
+  console.log(`[ส่งกลับ] push สำเร็จ ใช้เวลารวม ${Date.now() - startedAt}ms`);
+}
+
+// ส่งข้อความแบบ push (ไม่ผูกกับ replyToken) ใช้สำหรับส่งสรุปตามเวลาที่ตั้งไว้
+async function pushToLine(to, message) {
+  // เดิมถ้าส่ง array เข้ามาจะถูกห่อซ้อนอีกชั้นเป็น [[...]] แล้ว LINE ปฏิเสธ
+  // ต้องรองรับทั้ง string, object เดี่ยว และ array ให้เหมือน replyToLine
+  let messages;
+  if (typeof message === 'string') messages = [{ type: 'text', text: message }];
+  else if (Array.isArray(message)) messages = message;
+  else messages = [message];
+
+  const lineRes = await fetchWithTimeout('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${LINE_TOKEN}`
+    },
+    body: JSON.stringify({ to, messages })
+  }, 30000);
+  if (!lineRes.ok) {
+    console.error('LINE push error:', await lineRes.text());
+    throw new Error('ส่งข้อความ push ไม่สำเร็จ');
+  }
+}
+
+// หาชื่อชีต "สรุปสั่งซื้อ" จริงจากไฟล์ (เผื่อสะกด/เว้นวรรคต่างเล็กน้อย)
+let cachedSummaryTitle = null;
+async function resolveSummaryTitle() {
+  if (cachedSummaryTitle) return cachedSummaryTitle;
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: SPREADSHEET_ID,
+    fields: 'sheets.properties.title'
+  });
+  const titles = meta.data.sheets.map(s => s.properties.title);
+  const found = titles.find(t => t.trim().replace(/\s/g, '') === 'สรุปสั่งซื้อ');
+  if (!found) {
+    throw new Error(`ไม่พบชีตชื่อ "สรุปสั่งซื้อ" (ชีตที่มีอยู่จริง: ${titles.join(', ')})`);
+  }
+  cachedSummaryTitle = found;
+  return found;
+}
+
+// ดึงข้อมูลจากชีตสรุปสั่งซื้อ (ผลลัพธ์จากสูตร QUERY) คืนเป็น array ของแถว
+async function fetchSummaryRows() {
+  const sheets = getSheetsClient();
+  const title = await resolveSummaryTitle();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${quoteSheetName(title)}!A2:G` // ข้ามหัวตารางแถวแรก
+  });
+  return res.data.values || [];
+}
+
+// สร้าง Flex Message สรุปสั่งซื้อ รวมทุกซัพพลายเออร์ไว้ในการ์ดเดียว (bubble เดียว) จัดเป็นหมวดๆ ตามซัพพลายเออร์
+function buildSupplierSummaryFlex(rows) {
+  const todayStr = new Date().toLocaleDateString('th-TH');
+
+  if (rows.length === 0) {
+    return { type: 'text', text: `📦 สรุปสต็อกวันนี้ (${todayStr})\n\nสต็อกทุกอย่างเพียงพอ ไม่มีรายการที่ต้องสั่งเพิ่มครับ 👍` };
+  }
+
+  // จัดกลุ่มตามซัพพลายเออร์ (คอลัมน์แรก)
+  const groups = {};
+  rows.forEach(row => {
+    const supplier = row[0] || 'ไม่ระบุซัพพลายเออร์';
+    if (!groups[supplier]) groups[supplier] = [];
+    groups[supplier].push(row);
+  });
+
+  const supplierSections = Object.entries(groups).flatMap(([supplier, items], groupIdx) => {
+    const header = {
+      type: 'box',
+      layout: 'vertical',
+      margin: groupIdx === 0 ? 'none' : 'lg',
+      contents: [
+        { type: 'text', text: `🏷️ ${supplier}`, weight: 'bold', size: 'sm', color: '#1E7FD9', wrap: true },
+        { type: 'separator', margin: 'xs' }
+      ]
+    };
+    const itemBoxes = items.map(row => ({
+      type: 'box',
+      layout: 'vertical',
+      margin: 'md',
+      contents: [
+        { type: 'text', text: row[1] || '', wrap: true, size: 'sm', weight: 'bold' },
+        { type: 'text', text: `คงเหลือ ${row[3]} ${row[2] || ''}  (ต่ำกว่าขั้นต่ำ ${row[4]})`, size: 'xs', color: '#666666', wrap: true },
+        { type: 'text', text: `สั่งเพิ่ม ${row[6]} ${row[5] || ''}`, size: 'sm', weight: 'bold', color: '#FF0000' }
+      ]
+    }));
+    return [header, ...itemBoxes];
+  });
+
+  const totalItems = rows.length;
+  const supplierCount = Object.keys(groups).length;
+
+  return {
+    type: 'flex',
+    altText: `📦 สรุปสต็อกวันนี้: ต้องสั่งเพิ่ม ${totalItems} รายการ จาก ${supplierCount} ซัพพลายเออร์`,
+    contents: {
+      type: 'bubble',
+      size: 'giga',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          { type: 'text', text: `📦 สรุปสั่งซื้อ (${todayStr})`, weight: 'bold', size: 'lg' },
+          { type: 'text', text: `${totalItems} รายการ จาก ${supplierCount} ซัพพลายเออร์`, size: 'xs', color: '#888888' },
+          { type: 'separator', margin: 'md' },
+          ...supplierSections
+        ]
+      }
+    }
+  };
+}
+
+app.post('/webhook', async (req, res) => {
+  // ตอบ LINE ก่อนทันที ไม่งั้นถ้าประมวลผลนาน LINE จะคิดว่า error
+  res.status(200).send('OK');
+
+  const events = req.body.events || [];
+  // log แหล่งที่มาของทุกข้อความไว้ ใช้หา userId/groupId สำหรับส่งข้อความแบบ push
+  events.forEach(e => console.log('source:', JSON.stringify(e.source)));
+
+  const imageEvents = events.filter(e => e.type === 'message' && e.message.type === 'image');
+  if (imageEvents.length === 0) return;
+
+  // ใช้ replyToken ของรูปสุดท้ายในชุดนี้ ส่งข้อความสรุปกลับไปครั้งเดียว
+  const lastEvent = imageEvents[imageEvents.length - 1];
+  const replyToken = lastEvent.replyToken;
+  const target = replyTarget(lastEvent);
+  // จับเวลาจากตอนที่ webhook เข้ามา เพื่อรู้ว่า replyToken ยังใช้ได้อยู่ไหมตอนจะตอบ
+  const startedAt = Date.now();
+
+  try {
+    console.log(`กำลังดึงรูปทั้งหมด ${imageEvents.length} รูป...`);
+    // ดึงทุกรูปพร้อมกัน แทนที่จะรอทีละใบ ยิ่งรูปเยอะยิ่งประหยัดเวลา
+    const tImg = Date.now();
+    const images = await Promise.all(imageEvents.map(e => getLineImage(e.message.id)));
+    console.log(`[รูป] ดึงครบ ${images.length} ใบใน ${Date.now() - tImg}ms`);
+
+    // เริ่มอ่านชีต Master ไปพร้อมกันเลย งานนี้ไม่ได้รอผลจาก AI
+    // catch เปล่าไว้กัน error ลอยตอนที่ยังไม่ถึงคิว await ข้างล่าง
+    const lookupPromise = getMasterLookup();
+    lookupPromise.catch(() => {});
+
+    console.log('กำลังส่งให้ AI อ่านพร้อมกัน...');
+    const resultJsonText = await readStockImages(images);
+    console.log('ผลลัพธ์:', resultJsonText);
+
+    let replyMessage;
+    try {
+      const items = extractJsonArray(resultJsonText).map(reconcileItem);
+
+      console.log('กำลังดึงข้อมูล Master เพื่อเช็คข้ามวัน...');
+      // ปกติงานนี้เสร็จไปแล้วตั้งแต่ตอน AI ยังอ่านรูปอยู่ บรรทัดนี้จึงแทบไม่เสียเวลา
+      const lookup = await lookupPromise;
+      const checkedItems = items.map(item => applyCrossDayCheck(item, lookup));
+
+      console.log('กำลังบันทึกลง Google Sheet...');
+      const stkCodes = [...new Set(checkedItems.map(i => i['stk']).filter(Boolean))];
+      await removeExistingTodayEntries(stkCodes);
+      await appendMovementLog(checkedItems);
+      const { updatedCount, unmatched } = await updateMasterCurrentStock(checkedItems, lookup);
+      console.log(`บันทึกสำเร็จ: อัปเดตยอดคงเหลือ ${updatedCount} รายการ, หาไม่เจอ ${unmatched.length} รายการ`);
+
+      let summaryRows = [];
+      try {
+        summaryRows = await fetchSummaryRows();
+      } catch (e) {
+        console.warn('⚠️ ดึงสรุปสั่งซื้อไม่สำเร็จ (แสดงการ์ดโดยไม่มีส่วนสั่งซื้อ):', e.message);
+      }
+
+      const validationCard = buildValidationFlex(checkedItems, { updatedCount, unmatched }, summaryRows);
+      replyMessage = [validationCard];
+    } catch (e) {
+      console.error('parse JSON หรือบันทึก Sheet ไม่ผ่าน:', e.message);
+      const raw = 'บันทึกลง Sheet ไม่สำเร็จ: ' + e.message + '\n\nข้อมูลที่อ่านได้ (ตัดบางส่วน):\n' + resultJsonText;
+      replyMessage = raw.length > 4900 ? raw.slice(0, 4900) + '\n...(ตัดเพราะยาวเกิน)' : raw;
+    }
+
+    await deliverToLine(replyToken, target, replyMessage, startedAt);
+  } catch (err) {
+    console.error('เกิดข้อผิดพลาด:', err.stack || err.message);
+    try {
+      await deliverToLine(replyToken, target, 'ขออภัย อ่านรูปไม่สำเร็จ ลองถ่ายใหม่อีกครั้งครับ', startedAt);
+    } catch (e2) {
+      console.error('แจ้งผู้ใช้ไม่สำเร็จด้วย:', e2.message);
+    }
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send('LINE Stock Bot server is running');
+});
+
+// ปลายทางสำหรับตัวปลุกภายนอก ตอบสั้นและเร็วที่สุด ไม่แตะ Google Sheet
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true, uptimeSec: Math.round(process.uptime()) });
+});
+
+// endpoint นี้ถูกเรียกโดยตัวตั้งเวลาภายนอกทุกเช้า เพื่อส่งสรุปสั่งซื้อเข้า LINE
+// ป้องกันด้วย key ลับ กันคนนอกยิงเล่น: /cron/daily-summary?key=xxxxx
+app.get('/cron/daily-summary', async (req, res) => {
+  if (!CRON_SECRET || req.query.key !== CRON_SECRET) {
+    return res.status(403).send('Forbidden');
+  }
+  res.status(200).send('OK, sending...'); // ตอบก่อนเลย กันตัวตั้งเวลา timeout
+
+  try {
+    console.log('เริ่มส่งสรุปสั่งซื้อประจำวัน...');
+    const rows = await fetchSummaryRows();
+    const message = buildSupplierSummaryFlex(rows);
+    await pushToLine(LINE_PUSH_TARGET, message);
+    console.log(`ส่งสรุปสั่งซื้อสำเร็จ (${rows.length} รายการที่ต้องสั่ง)`);
+  } catch (err) {
+    console.error('ส่งสรุปสั่งซื้อล้มเหลว:', err.message);
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
