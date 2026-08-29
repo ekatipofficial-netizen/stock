@@ -72,6 +72,113 @@ async function resolveSheetTitles() {
 function quoteSheetName(name) {
   return `'${name.replace(/'/g, "''")}'`;
 }
+
+// ---------- จับคู่ชื่อสินค้าแบบยืดหยุ่น ----------
+// ชื่อที่อ่านจากลายมือในฟอร์ม กับชื่อในชีต Master มักไม่ตรงกันเป๊ะ
+// เว้นวรรคไม่เท่ากัน วรรณยุกต์หาย หรือสะกดเพี้ยนไปตัวสองตัว
+//
+// กติกาความปลอดภัยของทั้งหมดนี้: ถ้ามีสินค้าที่เข้าเค้าพอ ๆ กันมากกว่าหนึ่งตัว จะไม่เลือกเลย
+// เพราะจับผิดตัว = ยอดคงเหลือไปลงผิดสินค้า ซึ่งเสียหายกว่าการไม่อัปเดตแล้วแจ้งเตือน
+
+const THAI_MARKS = /[็-๎]/g; // ไม้ไต่คู้ วรรณยุกต์ทั้งสี่ ทัณฑฆาต นิคหิต ยามักการ
+
+function normalizeName(value) {
+  return String(value == null ? '' : value)
+    .normalize('NFC')
+    .replace(THAI_MARKS, '')                                   // ตัดวรรณยุกต์ทิ้ง
+    .replace(/\s/g, '')                                        // ตัดช่องว่างทุกชนิด
+    .replace(/[()[\]{}.,\-_/\\'"`~!@#$%^&*+=|?<>:;]/g, '')      // ตัดเครื่องหมายวรรคตอน
+    .toLowerCase();
+}
+
+// นับว่าต้องแก้กี่ตัวอักษรถึงจะกลายเป็นอีกคำหนึ่ง (Levenshtein)
+function editDistance(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// ชื่อยิ่งยาวยิ่งยอมให้ต่างได้มากขึ้น แต่ไม่เกิน 3 ตัว
+function distanceBudget(len) {
+  if (len <= 6) return 1;
+  if (len <= 12) return 2;
+  return 3;
+}
+
+// สร้างตัวจับคู่จากรายชื่อสินค้าจริงในชีต Master
+function buildNameResolver(masterNames) {
+  const exact = new Set(masterNames);
+  const byNorm = new Map(); // ชื่อที่ล้างแล้ว -> ชื่อจริงในชีตที่ล้างแล้วได้ค่านี้
+  for (const real of masterNames) {
+    const key = normalizeName(real);
+    if (!key) continue;
+    if (!byNorm.has(key)) byNorm.set(key, []);
+    byNorm.get(key).push(real);
+  }
+  const entries = [...byNorm.entries()];
+  const cache = new Map();
+
+  return function resolveName(raw) {
+    const name = String(raw == null ? '' : raw).trim();
+    if (!name) return null;
+    if (cache.has(name)) return cache.get(name);
+
+    let result = null;
+    const key = normalizeName(name);
+
+    // ชั้น 1 ตรงกันเป๊ะทุกตัวอักษร
+    if (exact.has(name)) {
+      result = { name, how: 'ตรงเป๊ะ', exact: true };
+    }
+
+    // ชั้น 2 ตรงกันหลังตัดเว้นวรรคและวรรณยุกต์ออก
+    if (!result && key) {
+      const hit = byNorm.get(key);
+      if (hit && hit.length === 1) {
+        result = { name: hit[0], how: 'ต่างที่เว้นวรรค/วรรณยุกต์' };
+      }
+    }
+
+    // ชั้น 3 ชื่อหนึ่งเป็นส่วนหนึ่งของอีกชื่อ เช่นในชีตมียี่ห้อต่อท้าย
+    // ต้องเจอสินค้าเดียวเท่านั้น ถ้าเจอหลายตัวถือว่ากำกวม ไม่เดา
+    if (!result && key.length >= 4) {
+      const found = new Set();
+      for (const [k, names] of entries) {
+        if (k.includes(key) || key.includes(k)) names.forEach(n => found.add(n));
+      }
+      if (found.size === 1) {
+        result = { name: [...found][0], how: 'ชื่อย่อ/ชื่อเต็ม' };
+      }
+    }
+
+    // ชั้น 4 สะกดเพี้ยนเล็กน้อย ต้องมีผู้ชนะเดี่ยวที่ดีกว่าอันดับสองจริง ๆ
+    if (!result && key) {
+      const budget = distanceBudget(key.length);
+      let best = null, bestDist = Infinity, runnerUpDist = Infinity;
+      for (const [k, names] of entries) {
+        if (Math.abs(k.length - key.length) > budget) continue; // ตัดตัวที่ยาวต่างกันมากทิ้งก่อน
+        const d = editDistance(key, k);
+        if (d < bestDist) { runnerUpDist = bestDist; bestDist = d; best = names; }
+        else if (d < runnerUpDist) { runnerUpDist = d; }
+      }
+      if (best && best.length === 1 && bestDist <= budget && bestDist < runnerUpDist) {
+        result = { name: best[0], how: `สะกดต่างกัน ${bestDist} ตัว` };
+      }
+    }
+
+    cache.set(name, result);
+    return result;
+  };
+}
 // ดึงรายชื่อสินค้าทั้งหมดในชีต Master พร้อมยอดคงเหลือปัจจุบัน (ก่อนอัปเดต) และตำแหน่งแถว
 async function getMasterLookup() {
   const sheets = getSheetsClient();
@@ -91,14 +198,17 @@ async function getMasterLookup() {
       nameToStock[name] = row[6]; // คอลัมน์ G
     }
   });
-  return { masterTitle, nameToRow, nameToStock };
+  // ตัวจับคู่ชื่อ สร้างครั้งเดียวต่อรอบ ใช้ร่วมกันทั้งตอนเช็คข้ามวันและตอนอัปเดตยอด
+  // เพื่อให้ทั้งสองที่ตัดสินใจเหมือนกันเสมอ
+  const resolve = buildNameResolver(Object.keys(nameToRow));
+  return { masterTitle, nameToRow, nameToStock, resolve };
 }
 
 // เช็คว่า "ยกยอดมา" ที่เขียนวันนี้ ตรงกับ "คงเหลือ" ที่บันทึกไว้จากครั้งก่อน (เมื่อวาน) หรือไม่
 // ถ้าไม่มีข้อมูลเก่าเลย (สินค้าใหม่/ยังไม่เคยบันทึก) จะข้ามการเช็คนี้ไป
-function applyCrossDayCheck(item, nameToStock) {
-  const name = (item['สินค้า'] || '').trim();
-  const prevRaw = nameToStock[name];
+function applyCrossDayCheck(item, lookup) {
+  const hit = lookup.resolve(item['สินค้า']);
+  const prevRaw = hit ? lookup.nameToStock[hit.name] : undefined;
   if (prevRaw === undefined || prevRaw === null || prevRaw === '') {
     return item; // ไม่มีข้อมูลเมื่อวานให้เทียบ ข้ามไป
   }
@@ -183,15 +293,20 @@ async function appendMovementLog(items) {
 // รับ lookup ที่ fetch ไว้ล่วงหน้าแล้ว (จาก getMasterLookup) กันการดึงข้อมูลซ้ำซ้อน
 async function updateMasterCurrentStock(items, lookup) {
   const sheets = getSheetsClient();
-  const { masterTitle, nameToRow } = lookup;
+  const { masterTitle, nameToRow, resolve } = lookup;
 
   const updates = [];
   const unmatched = [];
+  const fuzzy = []; // ที่จับคู่ได้แบบไม่ตรงเป๊ะ เก็บไว้แจ้งให้คนตรวจทาน
   for (const item of items) {
     const name = (item['สินค้า'] || '').trim();
-    const rowNum = nameToRow[name];
-    if (rowNum) {
-      updates.push({ range: `${quoteSheetName(masterTitle)}!G${rowNum}`, values: [[item['คงเหลือ']]] });
+    const hit = resolve(name);
+    if (hit && nameToRow[hit.name]) {
+      if (!hit.exact) fuzzy.push({ from: name, to: hit.name, how: hit.how });
+      updates.push({
+        range: `${quoteSheetName(masterTitle)}!G${nameToRow[hit.name]}`,
+        values: [[item['คงเหลือ']]]
+      });
     } else {
       unmatched.push(name);
     }
@@ -203,10 +318,14 @@ async function updateMasterCurrentStock(items, lookup) {
       requestBody: { valueInputOption: 'USER_ENTERED', data: updates }
     });
   }
+  if (fuzzy.length > 0) {
+    console.log('🔗 จับคู่ชื่อแบบยืดหยุ่น ' + fuzzy.length + ' รายการ:');
+    fuzzy.forEach(f => console.log(`   "${f.from}" -> "${f.to}"  (${f.how})`));
+  }
   if (unmatched.length > 0) {
     console.warn('⚠️ ไม่พบสินค้าเหล่านี้ในชีต Master (ไม่ได้อัปเดตยอด):', unmatched.join(', '));
   }
-  return { updatedCount: updates.length, unmatched };
+  return { updatedCount: updates.length, unmatched, fuzzy };
 }
 
 // ดึงไฟล์รูปจริงจากเซิร์ฟเวอร์ LINE โดยใช้ messageId
@@ -654,7 +773,7 @@ app.post('/webhook', async (req, res) => {
       console.log('กำลังดึงข้อมูล Master เพื่อเช็คข้ามวัน...');
       // ปกติงานนี้เสร็จไปแล้วตั้งแต่ตอน AI ยังอ่านรูปอยู่ บรรทัดนี้จึงแทบไม่เสียเวลา
       const lookup = await lookupPromise;
-      const checkedItems = items.map(item => applyCrossDayCheck(item, lookup.nameToStock));
+      const checkedItems = items.map(item => applyCrossDayCheck(item, lookup));
 
       console.log('กำลังบันทึกลง Google Sheet...');
       const stkCodes = [...new Set(checkedItems.map(i => i['stk']).filter(Boolean))];
