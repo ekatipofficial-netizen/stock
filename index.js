@@ -633,10 +633,15 @@ app.post('/webhook', async (req, res) => {
 
   try {
     console.log(`กำลังดึงรูปทั้งหมด ${imageEvents.length} รูป...`);
-    const images = [];
-    for (const event of imageEvents) {
-      images.push(await getLineImage(event.message.id));
-    }
+    // ดึงทุกรูปพร้อมกัน แทนที่จะรอทีละใบ ยิ่งรูปเยอะยิ่งประหยัดเวลา
+    const tImg = Date.now();
+    const images = await Promise.all(imageEvents.map(e => getLineImage(e.message.id)));
+    console.log(`[รูป] ดึงครบ ${images.length} ใบใน ${Date.now() - tImg}ms`);
+
+    // เริ่มอ่านชีต Master ไปพร้อมกันเลย งานนี้ไม่ได้รอผลจาก AI
+    // catch เปล่าไว้กัน error ลอยตอนที่ยังไม่ถึงคิว await ข้างล่าง
+    const lookupPromise = getMasterLookup();
+    lookupPromise.catch(() => {});
 
     console.log('กำลังส่งให้ AI อ่านพร้อมกัน...');
     const resultJsonText = await readStockImages(images);
@@ -647,7 +652,8 @@ app.post('/webhook', async (req, res) => {
       const items = extractJsonArray(resultJsonText).map(reconcileItem);
 
       console.log('กำลังดึงข้อมูล Master เพื่อเช็คข้ามวัน...');
-      const lookup = await getMasterLookup();
+      // ปกติงานนี้เสร็จไปแล้วตั้งแต่ตอน AI ยังอ่านรูปอยู่ บรรทัดนี้จึงแทบไม่เสียเวลา
+      const lookup = await lookupPromise;
       const checkedItems = items.map(item => applyCrossDayCheck(item, lookup.nameToStock));
 
       console.log('กำลังบันทึกลง Google Sheet...');
